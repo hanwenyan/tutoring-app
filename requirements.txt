@@ -1,0 +1,7 @@
+streamlit>=1.53.0
+langchain_google_genai
+langchain_core
+Pillow
+streamlit-drawable-canvas-fix
+streamlit-tldraw
+streamlit-ketcher
