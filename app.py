@@ -167,8 +167,16 @@ def stream_gemini_response(
 
         response_stream = model.stream(messages)
         for chunk in response_stream:
-            if chunk.content:
+            if not chunk.content:
+                continue
+            if isinstance(chunk.content, str):
                 yield chunk.content
+            elif isinstance(chunk.content, list):
+                for block in chunk.content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        yield block["text"]
+                    elif isinstance(block, str):
+                        yield block
 
     except (PermissionDenied, InvalidArgument) as e:
         if "API key" in str(e).lower() or "api_key" in str(e).lower() or "permission" in str(e).lower():
