@@ -3,6 +3,7 @@ import io
 import json
 from datetime import datetime
 from pathlib import Path
+import graphlib
 
 import numpy as np
 import streamlit as st
@@ -12,6 +13,7 @@ from streamlit_tldraw import st_tldraw
 from streamlit_ketcher import st_ketcher
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from google.api_core.exceptions import (
     InvalidArgument,
@@ -34,6 +36,8 @@ from kokoro_onnx import Kokoro
 MODEL_NAME = "gemini-3-flash-preview"
 DEFAULT_OLLAMA_MODEL = "kimi-k2.5:cloud"
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
+DEFAULT_NVIDIA_MODEL = "moonshotai/kimi-k2.5"
+DEFAULT_NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
 # --- File Size Limits ---
 MAX_IMAGE_SIZE_MB = 10
@@ -207,6 +211,11 @@ def get_chat_file_path() -> Path:
     return Path(__file__).parent / "chat_history.json"
 
 
+def get_graph_file_path() -> Path:
+    """Return the path to the knowledge graph JSON file."""
+    return Path(__file__).parent / "knowledge_graph.json"
+
+
 def save_chat(messages: list):
     """Serialize messages to JSON and write to chat_history.json."""
     serialized = []
@@ -245,6 +254,265 @@ def load_chat() -> list | None:
             msg["audio"] = base64.b64decode(entry["audio_b64"])
         messages.append(msg)
     return messages
+
+
+def save_graph(graph: dict):
+    """Serialize knowledge graph to JSON and write to knowledge_graph.json."""
+    with open(get_graph_file_path(), "w") as f:
+        json.dump(graph, f, indent=2)
+
+
+def load_graph() -> dict | None:
+    """Read knowledge_graph.json. Returns None if no file."""
+    path = get_graph_file_path()
+    if not path.exists():
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def validate_dag(nodes: dict) -> bool:
+    """Validate that the knowledge graph is a DAG using topological sort. Returns True if valid."""
+    try:
+        ts = graphlib.TopologicalSorter()
+        for node_id, node_data in nodes.items():
+            deps = node_data.get("deps", [])
+            ts.add(node_id, *deps)
+        # This will raise CycleError if there's a cycle
+        tuple(ts.static_order())
+        return True
+    except graphlib.CycleError:
+        return False
+
+
+def compute_node_state(node: dict) -> str:
+    """Compute node state: mastered | failing | in_progress | untested."""
+    mastery_level = node.get("mastery_level", 0)
+    decay_score = node.get("decay_score", 1.0)
+    times_tested = node.get("times_tested", 0)
+    times_correct = node.get("times_correct", 0)
+
+    # Green: mastered
+    if mastery_level >= 3 and decay_score > 0.5:
+        return "mastered"
+
+    # Red: failing
+    if times_tested > 0 and times_correct / times_tested < 0.5:
+        return "failing"
+
+    # Yellow: in progress or untested
+    if times_tested > 0:
+        return "in_progress"
+
+    return "untested"
+
+
+def get_next_node(graph: dict) -> str | None:
+    """Return the first unmastered node with satisfied dependencies, in topological order."""
+    nodes = graph.get("nodes", {})
+
+    # Build topological order
+    ts = graphlib.TopologicalSorter()
+    for node_id, node_data in nodes.items():
+        deps = node_data.get("deps", [])
+        ts.add(node_id, *deps)
+
+    topo_order = list(ts.static_order())
+
+    # Find first unmastered node with all deps mastered
+    for node_id in topo_order:
+        node = nodes[node_id]
+        state = compute_node_state(node)
+
+        if state != "mastered":
+            # Check if all dependencies are mastered
+            deps_mastered = all(
+                compute_node_state(nodes[dep]) == "mastered"
+                for dep in node.get("deps", [])
+                if dep in nodes
+            )
+            if deps_mastered:
+                return node_id
+
+    return None
+
+
+def is_node_locked(node_id: str, graph: dict) -> bool:
+    """Check if a node is locked (has unmastered dependencies)."""
+    nodes = graph.get("nodes", {})
+    node = nodes.get(node_id)
+    if not node:
+        return True
+
+    for dep in node.get("deps", []):
+        if dep in nodes and compute_node_state(nodes[dep]) != "mastered":
+            return True
+
+    return False
+
+
+def update_node_from_log(graph: dict, tutor_log: dict):
+    """Update node state based on TUTOR_LOG verdict."""
+    node_id = tutor_log.get("node")
+    if not node_id or node_id not in graph.get("nodes", {}):
+        return
+
+    node = graph["nodes"][node_id]
+    verdict = tutor_log.get("node_verdict", "not_assessed")
+
+    # Update times_tested
+    if verdict != "not_assessed":
+        node["times_tested"] = node.get("times_tested", 0) + 1
+        node["last_tested"] = datetime.now().isoformat()
+
+    # Update mastery based on verdict
+    if verdict == "mastered":
+        node["mastery_level"] = 3
+        node["times_correct"] = node.get("times_correct", 0) + 1
+        node["problem_step"] = 3  # Completed all steps
+        node["decay_score"] = 1.0  # Reset decay on mastery
+    elif verdict == "progressing":
+        node["times_correct"] = node.get("times_correct", 0) + 1
+        # Advance problem_step
+        current_step = node.get("problem_step", 0)
+        node["problem_step"] = min(current_step + 1, 3)
+        if node["problem_step"] >= 2:
+            node["mastery_level"] = min(node.get("mastery_level", 0) + 1, 3)
+    elif verdict == "struggling":
+        # Drop back to atomic (step 1) if not already there
+        if node.get("problem_step", 0) > 1:
+            node["problem_step"] = 1
+
+
+def build_graph_context(graph: dict, active_node: str | None) -> str:
+    """Build the <knowledge_graph_state> block for system prompt injection."""
+    if not graph or not active_node:
+        return ""
+
+    nodes = graph.get("nodes", {})
+    if active_node not in nodes:
+        return ""
+
+    active = nodes[active_node]
+    step = active.get("problem_step", 0)
+    step_names = {0: "Untested", 1: "Atomic Problem", 2: "Variation Problem", 3: "Boss Problem"}
+
+    lines = [
+        "<knowledge_graph_state>",
+        f"Current focus: {active_node} (Step {step}: {step_names.get(step, 'Unknown')})",
+        f"- Description: {active.get('description', 'N/A')}",
+        f"- Progress: {active.get('times_correct', 0)}/{active.get('times_tested', 0)} correct",
+        "",
+        "Dependencies:",
+    ]
+
+    # Show dependency status
+    for dep in active.get("deps", []):
+        if dep in nodes:
+            dep_node = nodes[dep]
+            state = compute_node_state(dep_node)
+            decay = dep_node.get("decay_score", 1.0)
+            status = "MASTERED" if state == "mastered" else state.upper()
+            lines.append(f"- {dep}: {status} (decay: {decay:.2f})")
+
+    # Show locked nodes
+    locked = [nid for nid in nodes if is_node_locked(nid, graph) and compute_node_state(nodes[nid]) != "mastered"]
+    if locked:
+        lines.append("")
+        lines.append("Locked (needs prereqs): " + ", ".join(locked[:5]))
+
+    # Show review-due nodes (decay < 0.5)
+    review_due = [nid for nid in nodes if compute_node_state(nodes[nid]) == "mastered" and nodes[nid].get("decay_score", 1.0) < 0.5]
+    if review_due:
+        lines.append("")
+        lines.append("Review due: " + ", ".join(review_due[:3]))
+
+    lines.append("</knowledge_graph_state>")
+    return "\n".join(lines)
+
+
+def generate_graph_prompt(subject: str) -> str:
+    """Generate a prompt for creating a knowledge graph."""
+    return f"""Generate a knowledge graph for {subject} tutoring.
+
+Create a JSON structure with 12-20 atomic, testable skills arranged as a dependency DAG. Each node should represent ONE specific skill that can be tested in isolation.
+
+Requirements:
+- Start with fundamental prerequisites (arithmetic, unit conversion)
+- Build up to complex applications
+- Each node needs exactly 0-3 dependencies
+- Use snake_case IDs (e.g., "mole_concept", "stoichiometry")
+- Labels should be concise (3-6 words)
+- Descriptions should be specific and testable
+
+Return ONLY valid JSON in this exact format:
+{{
+  "subject": "{subject}",
+  "nodes": {{
+    "arithmetic": {{
+      "label": "Basic Arithmetic",
+      "description": "Add, subtract, multiply, divide with decimals",
+      "deps": []
+    }},
+    "unit_conversion": {{
+      "label": "Unit Conversions",
+      "description": "Convert between metric units using dimensional analysis",
+      "deps": ["arithmetic"]
+    }},
+    "mole_concept": {{
+      "label": "The Mole Concept",
+      "description": "Avogadro's number and molar quantities",
+      "deps": ["arithmetic", "unit_conversion"]
+    }}
+  }}
+}}
+
+Generate the complete graph now."""
+
+
+def generate_graph(model, subject: str) -> dict | None:
+    """Generate a knowledge graph using the LLM. Returns graph dict or None on error."""
+    try:
+        prompt = generate_graph_prompt(subject)
+        messages = [
+            SystemMessage(content="You are a curriculum design expert. Generate valid JSON only, no markdown formatting."),
+            HumanMessage(content=prompt)
+        ]
+
+        response = model.invoke(messages)
+        response_text = response.content if hasattr(response, 'content') else str(response)
+
+        # Strip markdown code fences if present
+        response_text = response_text.strip()
+        if response_text.startswith("```"):
+            lines = response_text.split("\n")
+            response_text = "\n".join(lines[1:-1]) if len(lines) > 2 else response_text
+            response_text = response_text.replace("```json", "").replace("```", "").strip()
+
+        graph = json.loads(response_text)
+
+        # Add default state fields to each node
+        for node_id, node_data in graph.get("nodes", {}).items():
+            node_data.setdefault("mastery_level", 0)
+            node_data.setdefault("last_tested", None)
+            node_data.setdefault("times_correct", 0)
+            node_data.setdefault("times_tested", 0)
+            node_data.setdefault("problem_step", 0)
+            node_data.setdefault("decay_score", 1.0)
+
+        # Validate DAG
+        if not validate_dag(graph.get("nodes", {})):
+            st.error("Generated graph contains cycles. Please try again.")
+            return None
+
+        return graph
+
+    except json.JSONDecodeError as e:
+        st.error(f"Failed to parse graph JSON: {e}")
+        return None
+    except Exception as e:
+        st.error(f"Graph generation error: {e}")
+        return None
 
 
 def get_mime_type(filename: str) -> str:
@@ -289,6 +557,8 @@ def get_model(provider: str, model_name: str, api_key: str = "", base_url: str =
     """Create and cache a chat model instance for the given provider."""
     if provider == "ollama":
         return ChatOllama(model=model_name, base_url=base_url, temperature=0.5, num_ctx=16384)
+    elif provider == "nvidia":
+        return ChatOpenAI(model=model_name, api_key=api_key, base_url=base_url, temperature=0.5)
     return ChatGoogleGenerativeAI(model=model_name, temperature=0.5, google_api_key=api_key)
 
 
@@ -425,6 +695,7 @@ def stream_response(
     file_attachments: list | None = None,
     audio_data: bytes | None = None,
     chat_history: list | None = None,
+    graph_context: str = "",
 ):
     """
     Stream a response from the configured model provider.
@@ -436,6 +707,10 @@ def stream_response(
         st.error("Please provide your Google API Key in the sidebar.")
         return None
 
+    if provider == "nvidia" and not api_key:
+        st.error("No NVIDIA API key found. Add NVIDIA_API_KEY to secrets.toml or enter one in the sidebar.")
+        return None
+
     def _image_part(mime_type, b64_data):
         url = f"data:{mime_type};base64,{b64_data}"
         if provider == "ollama":
@@ -445,7 +720,12 @@ def stream_response(
     try:
         model = get_model(provider, model_name, api_key=api_key, base_url=base_url)
 
-        messages = [SystemMessage(content=system_prompt)]
+        # Inject graph context if available
+        full_system_prompt = system_prompt
+        if graph_context:
+            full_system_prompt = f"{system_prompt}\n\n{graph_context}"
+
+        messages = [SystemMessage(content=full_system_prompt)]
 
         # Add prior conversation turns
         for msg in (chat_history or []):
@@ -454,7 +734,7 @@ def stream_response(
                 for f in msg.get("files", []):
                     f_b64 = base64.b64encode(f["data"]).decode()
                     hist_content.append(_image_part(f["mime_type"], f_b64))
-                if msg.get("audio") and provider != "ollama":
+                if msg.get("audio") and provider == "gemini":
                     hist_content.append({
                         "type": "media",
                         "mime_type": "audio/wav",
@@ -470,9 +750,7 @@ def stream_response(
             f_b64 = base64.b64encode(f["data"]).decode()
             content.append(_image_part(f["mime_type"], f_b64))
         if audio_data:
-            if provider == "ollama":
-                st.info("Audio input is not supported with local models.")
-            else:
+            if provider == "gemini":
                 content.append(
                     {
                         "type": "media",
@@ -480,6 +758,8 @@ def stream_response(
                         "data": audio_data,
                     }
                 )
+            else:
+                st.info("Audio input is only supported with Gemini API.")
         messages.append(HumanMessage(content=content))
 
         response_stream = model.stream(messages)
@@ -540,7 +820,7 @@ def stream_response(
         st.error("Connection failed. Check your internet connection and try again.")
     except Exception as e:
         error_msg = str(e).lower()
-        if "api key" in error_msg or "api_key" in error_msg:
+        if "api key" in error_msg or "api_key" in error_msg or "unauthorized" in error_msg:
             st.error("Invalid API key. Please check your key and try again.")
         elif "rate" in error_msg and "limit" in error_msg:
             st.error("Rate limited. Please wait a moment and try again.")
@@ -550,6 +830,12 @@ def stream_response(
             st.error("Cannot connect to Ollama. Make sure it's running (`ollama serve`).")
         elif provider == "ollama" and "not found" in error_msg:
             st.error(f"Model '{model_name}' not found. Run: `ollama pull {model_name}`")
+        elif provider == "nvidia" and ("401" in error_msg or "unauthorized" in error_msg):
+            st.error("Invalid NVIDIA API key. Get one at https://build.nvidia.com/")
+        elif provider == "nvidia" and ("429" in error_msg or "rate" in error_msg):
+            st.error("⚠️ NVIDIA rate limit hit. Free-tier keys allow ~5 requests/min. Wait 60 seconds and try again.")
+        elif provider == "nvidia" and ("402" in error_msg or "payment" in error_msg or "credit" in error_msg):
+            st.error("NVIDIA API credits exhausted. Check your account at https://build.nvidia.com/")
         elif "connect" in error_msg or "network" in error_msg:
             st.error("Connection failed. Check your internet connection and try again.")
         else:
@@ -557,7 +843,7 @@ def stream_response(
 
 
 # --- Streamlit Page Configuration ---
-st.set_page_config(page_title="StudyBuddy", page_icon="📚")
+st.set_page_config(initial_sidebar_state="collapsed", page_title="StudyBuddy", page_icon="📚")
 
 st.markdown("""
 <style>
@@ -718,53 +1004,126 @@ st.caption("Your AI-powered tutoring assistant")
 
 # --- Load System Prompt from Secrets ---
 try:
-    system_prompt = st.secrets["SYSTEM_PROMPT"]
+    base_system_prompt = st.secrets["SYSTEM_PROMPT"]
 except (KeyError, FileNotFoundError):
     st.warning("SYSTEM_PROMPT not found in secrets.toml. Using a default prompt.")
-    system_prompt = (
+    base_system_prompt = (
         "You are a helpful and patient tutor. Help the student understand concepts, "
         "work through problems step-by-step, and encourage their learning progress."
     )
 
 # --- Chat History Initialization ---
-DEFAULT_GREETING = {
-    "role": "assistant",
-    "content": (
-        "**Welcome to StudyBuddy!** I'm your AI tutor — here to help you learn, "
-        "not just give answers.\n\n"
-        "Here's what I can do:\n"
-        "- **Explain concepts** step-by-step with guided questions\n"
-        "- **Work through problems** together (show me a photo of your homework!)\n"
-        "- **Analyze images & diagrams** — just attach a file or use the drawing tools\n"
-        "- **Listen to your voice** — tap the mic to ask a question out loud\n\n"
-        "**Try one of these to get started:**\n"
-        '- "Explain the difference between ionic and covalent bonds"\n'
-        '- "Help me balance this equation: Fe + O\u2082 \u2192 Fe\u2082O\u2083"\n'
-        "- \"What does $E = mc^2$ really mean?\"\n"
-        '- Attach a photo of a problem you\'re stuck on'
-    ),
-}
+def get_default_greeting(has_graph: bool) -> dict:
+    """Generate appropriate greeting based on whether knowledge graph exists."""
+    if has_graph:
+        return {
+            "role": "assistant",
+            "content": (
+                "**Welcome back!** I've loaded your knowledge map. "
+                "Ready to continue where we left off? Just say 'yes' or ask a question to begin."
+            ),
+        }
+    else:
+        return {
+            "role": "assistant",
+            "content": (
+                "**Welcome to StudyBuddy!** I'm your AI tutor — here to help you learn, "
+                "not just give answers.\n\n"
+                "Here's what I can do:\n"
+                "- **Explain concepts** step-by-step with guided questions\n"
+                "- **Work through problems** together (show me a photo of your homework!)\n"
+                "- **Analyze images & diagrams** — just attach a file or use the drawing tools\n"
+                "- **Listen to your voice** — tap the mic to ask a question out loud\n\n"
+                "**Try one of these to get started:**\n"
+                '- "Explain the difference between ionic and covalent bonds"\n'
+                '- "Help me balance this equation: Fe + O\u2082 \u2192 Fe\u2082O\u2083"\n'
+                "- \"What does $E = mc^2$ really mean?\"\n"
+                '- Attach a photo of a problem you\'re stuck on\n\n'
+                "**Or generate a Knowledge Map** from the sidebar to start structured learning!"
+            ),
+        }
+
+# --- Session State Initialization ---
+# Must initialize before sidebar accesses these values
+if "canvas_version" not in st.session_state:
+    st.session_state.canvas_version = 0
+if "tldraw_version" not in st.session_state:
+    st.session_state.tldraw_version = 0
+
+if "knowledge_graph" not in st.session_state:
+    st.session_state.knowledge_graph = load_graph()
+
+if "active_node" not in st.session_state:
+    # Auto-select first node if graph exists
+    if st.session_state.knowledge_graph:
+        st.session_state.active_node = get_next_node(st.session_state.knowledge_graph)
+    else:
+        st.session_state.active_node = None
 
 # --- Sidebar: Configuration ---
 with st.sidebar:
     st.markdown("#### :blue[Model]")
-    provider = st.radio("Provider", ["Gemini API", "Local (Ollama)"],
-                        key="provider", horizontal=True, label_visibility="collapsed")
+    provider = st.selectbox("Provider", ["NVIDIA API", "Gemini API", "Local (Ollama)"],
+                            key="provider", label_visibility="collapsed")
 
-    if provider == "Gemini API":
-        google_api_key = st.text_input(
-            "Google API Key", type="password", key="google_api_key",
-            placeholder="Paste your API key here"
+    if provider == "NVIDIA API":
+        # Load from secrets, allow user override
+        secret_nvidia_key = ""
+        try:
+            secret_nvidia_key = st.secrets["NVIDIA_API_KEY"]
+        except (KeyError, FileNotFoundError):
+            pass
+
+        nvidia_api_key = st.text_input(
+            "NVIDIA API Key (optional — built-in key available)",
+            type="password", key="nvidia_api_key",
+            placeholder="Override with your own key"
         )
-        st.caption("[Get your Google API key](https://aistudio.google.com/app/apikey)")
+        # Use user's key if provided, else fall back to secret
+        nvidia_api_key = nvidia_api_key or secret_nvidia_key
+
+        if nvidia_api_key:
+            st.caption("✅ API key active")
+        else:
+            st.caption("⚠️ No API key. [Get one at nvidia.com](https://build.nvidia.com/)")
+        provider_key = "nvidia"
+        model_name = DEFAULT_NVIDIA_MODEL
+        google_api_key = ""
+    elif provider == "Gemini API":
+        # Load from secrets, allow user override
+        secret_google_key = ""
+        try:
+            secret_google_key = st.secrets["GOOGLE_API_KEY"]
+        except (KeyError, FileNotFoundError):
+            pass
+
+        google_api_key = st.text_input(
+            "Google API Key (optional — built-in key available)",
+            type="password", key="google_api_key",
+            placeholder="Override with your own key"
+        )
+        # Use user's key if provided, else fall back to secret
+        google_api_key = google_api_key or secret_google_key
+
+        if google_api_key:
+            st.caption("✅ API key active")
+        else:
+            st.caption("⚠️ No API key. [Get one at aistudio.google.com](https://aistudio.google.com/app/apikey)")
         provider_key = "gemini"
         model_name = MODEL_NAME
+        nvidia_api_key = ""
     else:
         ollama_model = st.text_input("Model name:", value=DEFAULT_OLLAMA_MODEL,
                                       key="ollama_model")
         ollama_url = st.text_input("Ollama URL:", value=DEFAULT_OLLAMA_BASE_URL,
                                     key="ollama_base_url")
+        st.caption(
+            "Running remotely? Expose Ollama with "
+            "[ngrok](https://ngrok.com) (`ngrok http 11434`) "
+            "and paste the URL above."
+        )
         google_api_key = ""
+        nvidia_api_key = ""
         provider_key = "ollama"
         model_name = ollama_model
 
@@ -772,24 +1131,132 @@ with st.sidebar:
     st.markdown("#### :blue[Options]")
     tts_enabled = st.toggle("Read aloud", key="tts_enabled")
     st.divider()
+
+    # --- Knowledge Map Section ---
+    st.markdown("#### :blue[Knowledge Map]")
+
+    if st.session_state.knowledge_graph is None:
+        subject_input = st.text_input("Subject:", value="Chemistry", key="subject_input")
+        if st.button("Generate Map", use_container_width=True):
+            active_api_key = nvidia_api_key if provider_key == "nvidia" else google_api_key
+            if provider_key in ("nvidia", "gemini") and not active_api_key:
+                st.error("Please provide your API Key first.")
+            else:
+                with st.spinner(f"Generating {subject_input} knowledge graph..."):
+                    base_url_param = DEFAULT_NVIDIA_BASE_URL if provider_key == "nvidia" else st.session_state.get("ollama_base_url", DEFAULT_OLLAMA_BASE_URL)
+                    model = get_model(provider_key, model_name, api_key=active_api_key,
+                                    base_url=base_url_param)
+                    graph = generate_graph(model, subject_input)
+                    if graph:
+                        st.session_state.knowledge_graph = graph
+                        save_graph(graph)
+                        # Auto-select first node
+                        st.session_state.active_node = get_next_node(graph)
+                        st.success(f"Created {len(graph['nodes'])} nodes!")
+                        st.rerun()
+    else:
+        graph = st.session_state.knowledge_graph
+        nodes = graph.get("nodes", {})
+
+        # Progress bar
+        mastered_count = sum(1 for n in nodes.values() if compute_node_state(n) == "mastered")
+        total_count = len(nodes)
+        progress = mastered_count / total_count if total_count > 0 else 0
+        st.progress(progress, text=f"Progress: {mastered_count}/{total_count}")
+
+        # Node list
+        st.caption(f"**{graph.get('subject', 'Knowledge Graph')}**")
+
+        # Build topological order
+        ts = graphlib.TopologicalSorter()
+        for node_id, node_data in nodes.items():
+            deps = node_data.get("deps", [])
+            ts.add(node_id, *deps)
+        topo_order = list(ts.static_order())
+
+        # Display nodes
+        for node_id in topo_order:
+            node = nodes[node_id]
+            state = compute_node_state(node)
+            locked = is_node_locked(node_id, graph)
+
+            # Choose emoji
+            if state == "mastered":
+                emoji = "🟢"
+            elif state == "failing":
+                emoji = "🔴"
+            elif locked:
+                emoji = "🔒"
+            else:
+                emoji = "🟡"
+
+            # Active indicator
+            indicator = " ●" if node_id == st.session_state.active_node else ""
+
+            # Button label
+            label = f"{emoji} {node['label']}{indicator}"
+
+            # Step indicator for active node
+            if node_id == st.session_state.active_node:
+                step = node.get("problem_step", 0)
+                if step > 0:
+                    label += f" [{step}/3]"
+
+            if st.button(label, key=f"node_{node_id}", disabled=locked, use_container_width=True):
+                st.session_state.active_node = node_id
+                # Inject a navigation prompt
+                nav_msg = {
+                    "role": "user",
+                    "content": f"[NAVIGATE TO NODE: {node_id}]",
+                    "timestamp": datetime.now().isoformat()
+                }
+                st.session_state.messages.append(nav_msg)
+                st.rerun()
+
+        # Review-due section
+        review_due = [nid for nid in nodes if compute_node_state(nodes[nid]) == "mastered" and nodes[nid].get("decay_score", 1.0) < 0.5]
+        if review_due:
+            st.divider()
+            st.caption("🔄 **Review Needed**")
+            for nid in review_due[:3]:
+                node = nodes[nid]
+                if st.button(f"🔄 {node['label']}", key=f"review_{nid}", use_container_width=True):
+                    st.session_state.active_node = nid
+                    st.rerun()
+
+        st.divider()
+        if st.button("Reset Map", use_container_width=True):
+            graph_file = get_graph_file_path()
+            if graph_file.exists():
+                graph_file.unlink()
+            st.session_state.knowledge_graph = None
+            st.session_state.active_node = None
+            st.rerun()
+
+    st.divider()
     if st.button("New Chat", use_container_width=True):
-        st.session_state.messages = [DEFAULT_GREETING]
+        has_graph = st.session_state.knowledge_graph is not None
+        st.session_state.messages = [get_default_greeting(has_graph)]
         chat_file = get_chat_file_path()
         if chat_file.exists():
             chat_file.unlink()
         st.rerun()
-
-if "canvas_version" not in st.session_state:
-    st.session_state.canvas_version = 0
-if "tldraw_version" not in st.session_state:
-    st.session_state.tldraw_version = 0
 
 if "messages" not in st.session_state:
     saved = load_chat()
     if saved:
         st.session_state.messages = saved
     else:
-        st.session_state.messages = [DEFAULT_GREETING]
+        has_graph = st.session_state.knowledge_graph is not None
+        st.session_state.messages = [get_default_greeting(has_graph)]
+
+# Flag to check if we need to auto-start
+if "auto_start_needed" not in st.session_state:
+    st.session_state.auto_start_needed = (
+        st.session_state.knowledge_graph is not None and
+        st.session_state.active_node is not None and
+        len(st.session_state.messages) == 1
+    )
 
 # --- Display Chat History ---
 for idx, message in enumerate(st.session_state.messages):
@@ -818,6 +1285,16 @@ for idx, message in enumerate(st.session_state.messages):
                 audio_bytes = st.session_state.get(cache_key)
                 if audio_bytes:
                     st.audio(audio_bytes, format="audio/wav", autoplay=True)
+
+# --- Auto-start with first problem if needed ---
+if st.session_state.auto_start_needed:
+    if st.button("🚀 Start Learning!", type="primary", use_container_width=True):
+        st.session_state.auto_start_needed = False
+        # Trigger first problem
+        prompt = "I'm ready to start!"
+        user_message = {"role": "user", "content": prompt, "timestamp": datetime.now().isoformat()}
+        st.session_state.messages.append(user_message)
+        st.rerun()
 
 # --- Drawing Canvas ---
 st.caption("TOOLS")
@@ -938,24 +1415,53 @@ if result:
 
     # Stream assistant response
     with st.chat_message("assistant"):
+        # Build graph context if available
+        graph_ctx = ""
+        if st.session_state.knowledge_graph and st.session_state.active_node:
+            graph_ctx = build_graph_context(st.session_state.knowledge_graph, st.session_state.active_node)
+
+        active_api_key = nvidia_api_key if provider_key == "nvidia" else google_api_key
+        base_url_param = DEFAULT_NVIDIA_BASE_URL if provider_key == "nvidia" else st.session_state.get("ollama_base_url", DEFAULT_OLLAMA_BASE_URL)
+
         response = st.write_stream(
             stream_response(
                 prompt,
                 provider_key,
                 model_name,
-                system_prompt,
-                api_key=google_api_key,
-                base_url=st.session_state.get("ollama_base_url", DEFAULT_OLLAMA_BASE_URL),
+                base_system_prompt,
+                api_key=active_api_key,
+                base_url=base_url_param,
                 file_attachments=file_attachments or None,
                 audio_data=audio_data,
                 chat_history=st.session_state.messages[:-1],
+                graph_context=graph_ctx,
             )
         )
         if response:
             msg = {"role": "assistant", "content": response, "timestamp": datetime.now().isoformat()}
             if '_pending_tutor_log' in st.session_state:
-                msg["tutor_log"] = st.session_state._pending_tutor_log
+                tutor_log = st.session_state._pending_tutor_log
+                msg["tutor_log"] = tutor_log
                 del st.session_state._pending_tutor_log
+
+                # Update knowledge graph if applicable
+                if st.session_state.knowledge_graph and tutor_log.get("node"):
+                    update_node_from_log(st.session_state.knowledge_graph, tutor_log)
+                    save_graph(st.session_state.knowledge_graph)
+
+                    # Auto-advance if mastered
+                    if tutor_log.get("node_verdict") == "mastered":
+                        next_node = get_next_node(st.session_state.knowledge_graph)
+                        if next_node:
+                            st.session_state.active_node = next_node
+                            st.toast(f"✅ Mastered! Moving to: {st.session_state.knowledge_graph['nodes'][next_node]['label']}")
+
+                    # Apply decay to all mastered nodes
+                    for node in st.session_state.knowledge_graph.get("nodes", {}).values():
+                        if compute_node_state(node) == "mastered":
+                            node["decay_score"] = node.get("decay_score", 1.0) * 0.95
+                    save_graph(st.session_state.knowledge_graph)
+
             st.session_state.messages.append(msg)
             save_chat(st.session_state.messages)
             if tts_enabled:

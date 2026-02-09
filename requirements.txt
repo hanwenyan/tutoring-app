@@ -3,6 +3,7 @@ langchain_google_genai
 google-api-core
 langchain_core
 langchain-ollama
+langchain-openai
 Pillow
 streamlit-drawable-canvas-fix
 streamlit-tldraw
