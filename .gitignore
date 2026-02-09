@@ -1,5 +1,0 @@
-__pycache__/
-*.pyc
-chat_history.json
-.streamlit/secrets.toml
-.env
