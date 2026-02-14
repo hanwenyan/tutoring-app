@@ -1,11 +1,18 @@
+"""
+StudyBuddy - AI-powered 1:1 tutoring assistant
+Main Streamlit app entry point
+"""
+
 import base64
 import io
 import json
 from datetime import datetime
 from pathlib import Path
-import graphlib
+import secrets
+import tempfile
+import os
+import re
 
-import numpy as np
 import streamlit as st
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas
@@ -23,197 +30,62 @@ from google.api_core.exceptions import (
     DeadlineExceeded,
 )
 from requests.exceptions import ConnectionError as RequestsConnectionError
-import re
-import wave
 
-import requests as _requests_lib
-import soundfile as sf
-from google import genai
-from google.genai import types
-from kokoro_onnx import Kokoro
-
-# --- Model Configuration ---
-MODEL_NAME = "gemini-3-flash-preview"
-DEFAULT_OLLAMA_MODEL = "kimi-k2.5:cloud"
-DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
-DEFAULT_NVIDIA_MODEL = "moonshotai/kimi-k2.5"
-DEFAULT_NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
-
-# --- File Size Limits ---
-MAX_IMAGE_SIZE_MB = 10
-MAX_PDF_SIZE_MB = 50
-MAX_IMAGE_SIZE_BYTES = MAX_IMAGE_SIZE_MB * 1024 * 1024
-MAX_PDF_SIZE_BYTES = MAX_PDF_SIZE_MB * 1024 * 1024
-
-# --- Unicode Math / Chemistry Symbols to Spoken English ---
-UNICODE_MATH_MAP = {
-    "≤": "less than or equal to", "≥": "greater than or equal to",
-    "≠": "not equal to", "≈": "approximately equal to",
-    "±": "plus or minus", "∓": "minus or plus",
-    "×": "times", "÷": "divided by", "·": "times",
-    "→": "yields", "←": "yields", "⇌": "is in equilibrium with",
-    "⇒": "implies", "⇔": "if and only if",
-    "∞": "infinity", "∂": "partial",
-    "∑": "sum of", "∏": "product of", "∫": "integral of",
-    "√": "square root of", "∛": "cube root of",
-    "°": "degrees", "′": "prime", "″": "double prime",
-    "Δ": "delta", "δ": "delta",
-    "α": "alpha", "β": "beta", "γ": "gamma", "ε": "epsilon",
-    "θ": "theta", "λ": "lambda", "μ": "mu", "π": "pi",
-    "ρ": "rho", "σ": "sigma", "τ": "tau", "φ": "phi",
-    "ω": "omega", "η": "eta", "κ": "kappa", "ν": "nu",
-    "ξ": "xi", "ψ": "psi", "χ": "chi", "ζ": "zeta",
-    "Ω": "omega", "Φ": "phi", "Ψ": "psi", "Σ": "sigma",
-    "Π": "pi", "Λ": "lambda", "Θ": "theta", "Γ": "gamma",
-    "⁺": "plus", "⁻": "minus",
-    "₂": "2", "₃": "3", "₄": "4",
-    "⁰": "0", "¹": "1", "²": "squared", "³": "cubed",
-    "℃": "degrees celsius", "℉": "degrees fahrenheit",
-    "Å": "angstroms",
-}
-
-# Regex covering major emoji Unicode ranges
-_EMOJI_RE = re.compile(
-    "["
-    "\U0001F600-\U0001F64F"  # emoticons
-    "\U0001F300-\U0001F5FF"  # symbols & pictographs
-    "\U0001F680-\U0001F6FF"  # transport & map
-    "\U0001F1E0-\U0001F1FF"  # flags
-    "\U0001F900-\U0001F9FF"  # supplemental symbols
-    "\U0001FA00-\U0001FA6F"  # chess symbols
-    "\U0001FA70-\U0001FAFF"  # symbols extended-A
-    "\U00002702-\U000027B0"  # dingbats
-    "\U0000FE00-\U0000FE0F"  # variation selectors
-    "\U0000200D"             # zero width joiner
-    "\U000023CF-\U000023F3"  # misc technical
-    "\U0000231A-\U0000231B"  # watch/hourglass
-    "\U00002934-\U00002935"  # arrows
-    "\U000025AA-\U000025FE"  # geometric shapes
-    "\U00002600-\U000026FF"  # misc symbols
-    "\U00002B05-\U00002B55"  # arrows/stars
-    "]+",
-    flags=re.UNICODE,
+from utils import (
+    MODEL_NAME,
+    DEFAULT_OLLAMA_MODEL,
+    DEFAULT_OLLAMA_BASE_URL,
+    DEFAULT_NVIDIA_MODEL,
+    DEFAULT_NVIDIA_BASE_URL,
+    get_mime_type,
+    compress_image,
+    validate_file_size,
+    parse_tutor_log,
+    parse_log_fields,
+    normalize_markdown_newlines,
 )
+from tts import generate_tts
+from subjects import SUBJECT_NAMES, DEFAULT_SUBJECT, get_subject_config
 
-# --- LaTeX-to-Speech Helpers ---
-_GREEK_LATEX = {
-    r"\alpha": "alpha", r"\beta": "beta", r"\gamma": "gamma",
-    r"\delta": "delta", r"\epsilon": "epsilon", r"\varepsilon": "epsilon",
-    r"\zeta": "zeta", r"\eta": "eta", r"\theta": "theta",
-    r"\iota": "iota", r"\kappa": "kappa", r"\lambda": "lambda",
-    r"\mu": "mu", r"\nu": "nu", r"\xi": "xi", r"\pi": "pi",
-    r"\rho": "rho", r"\sigma": "sigma", r"\tau": "tau",
-    r"\upsilon": "upsilon", r"\phi": "phi", r"\varphi": "phi",
-    r"\chi": "chi", r"\psi": "psi", r"\omega": "omega",
-    r"\Gamma": "gamma", r"\Delta": "delta", r"\Theta": "theta",
-    r"\Lambda": "lambda", r"\Xi": "xi", r"\Pi": "pi",
-    r"\Sigma": "sigma", r"\Phi": "phi", r"\Psi": "psi",
-    r"\Omega": "omega",
-}
+# --- Feature Flags ---
+KG_ENABLED = True
 
 
-def _superscript_to_text(content: str) -> str:
-    """Convert superscript content like '2', '3', '2+' to spoken form."""
-    content = content.strip()
-    if content == "2":
-        return "squared"
-    if content == "3":
-        return "cubed"
-    if re.match(r"^\d+[+\-]$", content):
-        sign = "plus" if content[-1] == "+" else "minus"
-        return f"to the {content[:-1]} {sign}"
-    return f"to the {content}"
+# --- Session and Path Management ---
+
+def get_session_id() -> str:
+    """Get or create a persistent session ID via URL query param."""
+    params = st.query_params
+    sid = params.get("s")
+
+    # 1. Valid ?s= in URL — use it
+    if sid and re.match(r'^[0-9a-f]{8}$', sid):
+        return sid
+
+    # 2. New visitor — generate fresh ID
+    sid = secrets.token_hex(4)
+    st.query_params["s"] = sid
+    return sid
 
 
-def _superscript_to_text_simple(char: str) -> str:
-    """Convert a single-char superscript like ^2 to spoken form."""
-    if char == "2":
-        return "squared"
-    if char == "3":
-        return "cubed"
-    return f"to the {char}"
 
 
-def latex_to_speakable(text: str) -> str:
-    """Convert LaTeX content (without $ delimiters) to spoken English."""
-    # Phase 1: Greek letters (longest-first to avoid partial matches)
-    for cmd in sorted(_GREEK_LATEX, key=len, reverse=True):
-        text = text.replace(cmd, f" {_GREEK_LATEX[cmd]} ")
-
-    # Phase 2: Structural commands (iterate for nested constructs)
-    for _ in range(10):
-        prev = text
-        # \frac{a}{b} → "a over b"
-        text = re.sub(r"\\frac\{([^{}]*)\}\{([^{}]*)\}", r" \1 over \2 ", text)
-        # \sqrt[n]{x} → "the nth root of x"
-        text = re.sub(r"\\sqrt\[([^\]]+)\]\{([^{}]*)\}", r" the \1th root of \2 ", text)
-        # \sqrt{x} → "square root of x"
-        text = re.sub(r"\\sqrt\{([^{}]*)\}", r" square root of \1 ", text)
-        # x^{content} → via helper
-        text = re.sub(r"\^\{([^{}]*)\}", lambda m: f" {_superscript_to_text(m.group(1))} ", text)
-        # x^N (single char) → via helper
-        text = re.sub(r"\^([A-Za-z0-9])", lambda m: f" {_superscript_to_text_simple(m.group(1))} ", text)
-        # x_{content} → subscript as space-separated
-        text = re.sub(r"_\{([^{}]*)\}", r" \1 ", text)
-        # x_N (single char) → space
-        text = re.sub(r"_([A-Za-z0-9])", r" \1 ", text)
-        # \text{...}, \mathrm{...}, \textbf{...}, \textit{...} → unwrap
-        text = re.sub(r"\\(?:text|mathrm|textbf|textit|mathbf|mathit|operatorname)\{([^{}]*)\}", r" \1 ", text)
-        if text == prev:
-            break
-
-    # Operators
-    for cmd, spoken in [
-        (r"\times", "times"), (r"\cdot", "times"), (r"\div", "divided by"),
-        (r"\pm", "plus or minus"), (r"\mp", "minus or plus"),
-        (r"\leq", "less than or equal to"), (r"\geq", "greater than or equal to"),
-        (r"\neq", "not equal to"), (r"\approx", "approximately equal to"),
-        (r"\lt", "less than"), (r"\gt", "greater than"),
-        (r"\rightarrow", "yields"), (r"\to", "yields"),
-        (r"\leftarrow", "yields"),
-        (r"\rightleftharpoons", "is in equilibrium with"),
-        (r"\leftrightarrow", "is in equilibrium with"),
-        (r"\infty", "infinity"), (r"\partial", "partial"),
-        (r"\nabla", "del"),
-        (r"\int", "integral of"), (r"\sum", "sum of"),
-        (r"\prod", "product of"), (r"\lim", "limit of"),
-        (r"\log", "log"), (r"\ln", "natural log of"),
-        (r"\sin", "sine"), (r"\cos", "cosine"), (r"\tan", "tangent"),
-        (r"\sec", "secant"), (r"\csc", "cosecant"), (r"\cot", "cotangent"),
-        (r"\arcsin", "arc sine"), (r"\arccos", "arc cosine"), (r"\arctan", "arc tangent"),
-        (r"\overline", "bar"), (r"\vec", "vector"), (r"\hat", "hat"),
-        (r"\dot", "dot"), (r"\ddot", "double dot"),
-        (r"\left", ""), (r"\right", ""),
-        (r"\big", ""), (r"\Big", ""), (r"\bigg", ""), (r"\Bigg", ""),
-    ]:
-        text = text.replace(cmd, f" {spoken} ")
-
-    # Spacing commands → space
-    for cmd in [r"\,", r"\;", r"\:", r"\!", r"\quad", r"\qquad", r"\ "]:
-        text = text.replace(cmd, " ")
-
-    # Phase 3: Unicode symbols
-    for sym, spoken in UNICODE_MATH_MAP.items():
-        text = text.replace(sym, f" {spoken} ")
-
-    # Phase 4: Emoji stripping
-    text = _EMOJI_RE.sub(" ", text)
-
-    # Phase 5: Cleanup
-    text = re.sub(r"\\[a-zA-Z]+", " ", text)  # remaining \commands
-    text = re.sub(r"[{}$&\\]", " ", text)       # stray braces, $, &, backslash
-    text = re.sub(r"\s+", " ", text)            # collapse whitespace
-    return text.strip()
+def get_data_dir() -> Path:
+    """Return the per-session data directory, creating it if needed."""
+    sid = get_session_id()
+    data_dir = Path(__file__).parent / "data" / sid
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
 
 
 def get_chat_file_path() -> Path:
     """Return the path to the local chat history JSON file."""
-    return Path(__file__).parent / "chat_history.json"
+    return get_data_dir() / "chat_history.json"
 
 
 def get_graph_file_path() -> Path:
     """Return the path to the knowledge graph JSON file."""
-    return Path(__file__).parent / "knowledge_graph.json"
+    return get_data_dir() / "knowledge_graph.json"
 
 
 def save_chat(messages: list):
@@ -224,14 +96,21 @@ def save_chat(messages: list):
         if "files" in msg:
             entry["files"] = []
             for f in msg["files"]:
-                serialized_file = {k: v for k, v in f.items() if k != "data"}
+                serialized_file = {k: v for k, v in f.items() if k not in ("data", "data_b64_cache")}
                 serialized_file["data_b64"] = base64.b64encode(f["data"]).decode()
                 entry["files"].append(serialized_file)
         if "audio" in msg:
             entry["audio_b64"] = base64.b64encode(msg["audio"]).decode()
         serialized.append(entry)
-    with open(get_chat_file_path(), "w") as f:
-        json.dump(serialized, f, indent=2)
+    path = get_chat_file_path()
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(serialized, f, indent=2)
+        os.replace(tmp, path)
+    except:
+        os.unlink(tmp)
+        raise
 
 
 def load_chat() -> list | None:
@@ -239,8 +118,12 @@ def load_chat() -> list | None:
     path = get_chat_file_path()
     if not path.exists():
         return None
-    with open(path) as f:
-        data = json.load(f)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        st.warning("Chat history was corrupted and has been reset.")
+        return None
     messages = []
     for entry in data:
         msg = {k: v for k, v in entry.items() if k not in ("files", "audio_b64")}
@@ -256,301 +139,7 @@ def load_chat() -> list | None:
     return messages
 
 
-def save_graph(graph: dict):
-    """Serialize knowledge graph to JSON and write to knowledge_graph.json."""
-    with open(get_graph_file_path(), "w") as f:
-        json.dump(graph, f, indent=2)
-
-
-def load_graph() -> dict | None:
-    """Read knowledge_graph.json. Returns None if no file."""
-    path = get_graph_file_path()
-    if not path.exists():
-        return None
-    with open(path) as f:
-        return json.load(f)
-
-
-def validate_dag(nodes: dict) -> bool:
-    """Validate that the knowledge graph is a DAG using topological sort. Returns True if valid."""
-    try:
-        ts = graphlib.TopologicalSorter()
-        for node_id, node_data in nodes.items():
-            deps = node_data.get("deps", [])
-            ts.add(node_id, *deps)
-        # This will raise CycleError if there's a cycle
-        tuple(ts.static_order())
-        return True
-    except graphlib.CycleError:
-        return False
-
-
-def compute_node_state(node: dict) -> str:
-    """Compute node state: mastered | failing | in_progress | untested."""
-    mastery_level = node.get("mastery_level", 0)
-    decay_score = node.get("decay_score", 1.0)
-    times_tested = node.get("times_tested", 0)
-    times_correct = node.get("times_correct", 0)
-
-    # Green: mastered
-    if mastery_level >= 3 and decay_score > 0.5:
-        return "mastered"
-
-    # Red: failing
-    if times_tested > 0 and times_correct / times_tested < 0.5:
-        return "failing"
-
-    # Yellow: in progress or untested
-    if times_tested > 0:
-        return "in_progress"
-
-    return "untested"
-
-
-def get_next_node(graph: dict) -> str | None:
-    """Return the first unmastered node with satisfied dependencies, in topological order."""
-    nodes = graph.get("nodes", {})
-
-    # Build topological order
-    ts = graphlib.TopologicalSorter()
-    for node_id, node_data in nodes.items():
-        deps = node_data.get("deps", [])
-        ts.add(node_id, *deps)
-
-    topo_order = list(ts.static_order())
-
-    # Find first unmastered node with all deps mastered
-    for node_id in topo_order:
-        node = nodes[node_id]
-        state = compute_node_state(node)
-
-        if state != "mastered":
-            # Check if all dependencies are mastered
-            deps_mastered = all(
-                compute_node_state(nodes[dep]) == "mastered"
-                for dep in node.get("deps", [])
-                if dep in nodes
-            )
-            if deps_mastered:
-                return node_id
-
-    return None
-
-
-def is_node_locked(node_id: str, graph: dict) -> bool:
-    """Check if a node is locked (has unmastered dependencies)."""
-    nodes = graph.get("nodes", {})
-    node = nodes.get(node_id)
-    if not node:
-        return True
-
-    for dep in node.get("deps", []):
-        if dep in nodes and compute_node_state(nodes[dep]) != "mastered":
-            return True
-
-    return False
-
-
-def update_node_from_log(graph: dict, tutor_log: dict):
-    """Update node state based on TUTOR_LOG verdict."""
-    node_id = tutor_log.get("node")
-    if not node_id or node_id not in graph.get("nodes", {}):
-        return
-
-    node = graph["nodes"][node_id]
-    verdict = tutor_log.get("node_verdict", "not_assessed")
-
-    # Update times_tested
-    if verdict != "not_assessed":
-        node["times_tested"] = node.get("times_tested", 0) + 1
-        node["last_tested"] = datetime.now().isoformat()
-
-    # Update mastery based on verdict
-    if verdict == "mastered":
-        node["mastery_level"] = 3
-        node["times_correct"] = node.get("times_correct", 0) + 1
-        node["problem_step"] = 3  # Completed all steps
-        node["decay_score"] = 1.0  # Reset decay on mastery
-    elif verdict == "progressing":
-        node["times_correct"] = node.get("times_correct", 0) + 1
-        # Advance problem_step
-        current_step = node.get("problem_step", 0)
-        node["problem_step"] = min(current_step + 1, 3)
-        if node["problem_step"] >= 2:
-            node["mastery_level"] = min(node.get("mastery_level", 0) + 1, 3)
-    elif verdict == "struggling":
-        # Drop back to atomic (step 1) if not already there
-        if node.get("problem_step", 0) > 1:
-            node["problem_step"] = 1
-
-
-def build_graph_context(graph: dict, active_node: str | None) -> str:
-    """Build the <knowledge_graph_state> block for system prompt injection."""
-    if not graph or not active_node:
-        return ""
-
-    nodes = graph.get("nodes", {})
-    if active_node not in nodes:
-        return ""
-
-    active = nodes[active_node]
-    step = active.get("problem_step", 0)
-    step_names = {0: "Untested", 1: "Atomic Problem", 2: "Variation Problem", 3: "Boss Problem"}
-
-    lines = [
-        "<knowledge_graph_state>",
-        f"Current focus: {active_node} (Step {step}: {step_names.get(step, 'Unknown')})",
-        f"- Description: {active.get('description', 'N/A')}",
-        f"- Progress: {active.get('times_correct', 0)}/{active.get('times_tested', 0)} correct",
-        "",
-        "Dependencies:",
-    ]
-
-    # Show dependency status
-    for dep in active.get("deps", []):
-        if dep in nodes:
-            dep_node = nodes[dep]
-            state = compute_node_state(dep_node)
-            decay = dep_node.get("decay_score", 1.0)
-            status = "MASTERED" if state == "mastered" else state.upper()
-            lines.append(f"- {dep}: {status} (decay: {decay:.2f})")
-
-    # Show locked nodes
-    locked = [nid for nid in nodes if is_node_locked(nid, graph) and compute_node_state(nodes[nid]) != "mastered"]
-    if locked:
-        lines.append("")
-        lines.append("Locked (needs prereqs): " + ", ".join(locked[:5]))
-
-    # Show review-due nodes (decay < 0.5)
-    review_due = [nid for nid in nodes if compute_node_state(nodes[nid]) == "mastered" and nodes[nid].get("decay_score", 1.0) < 0.5]
-    if review_due:
-        lines.append("")
-        lines.append("Review due: " + ", ".join(review_due[:3]))
-
-    lines.append("</knowledge_graph_state>")
-    return "\n".join(lines)
-
-
-def generate_graph_prompt(subject: str) -> str:
-    """Generate a prompt for creating a knowledge graph."""
-    return f"""Generate a knowledge graph for {subject} tutoring.
-
-Create a JSON structure with 12-20 atomic, testable skills arranged as a dependency DAG. Each node should represent ONE specific skill that can be tested in isolation.
-
-Requirements:
-- Start with fundamental prerequisites (arithmetic, unit conversion)
-- Build up to complex applications
-- Each node needs exactly 0-3 dependencies
-- Use snake_case IDs (e.g., "mole_concept", "stoichiometry")
-- Labels should be concise (3-6 words)
-- Descriptions should be specific and testable
-
-Return ONLY valid JSON in this exact format:
-{{
-  "subject": "{subject}",
-  "nodes": {{
-    "arithmetic": {{
-      "label": "Basic Arithmetic",
-      "description": "Add, subtract, multiply, divide with decimals",
-      "deps": []
-    }},
-    "unit_conversion": {{
-      "label": "Unit Conversions",
-      "description": "Convert between metric units using dimensional analysis",
-      "deps": ["arithmetic"]
-    }},
-    "mole_concept": {{
-      "label": "The Mole Concept",
-      "description": "Avogadro's number and molar quantities",
-      "deps": ["arithmetic", "unit_conversion"]
-    }}
-  }}
-}}
-
-Generate the complete graph now."""
-
-
-def generate_graph(model, subject: str) -> dict | None:
-    """Generate a knowledge graph using the LLM. Returns graph dict or None on error."""
-    try:
-        prompt = generate_graph_prompt(subject)
-        messages = [
-            SystemMessage(content="You are a curriculum design expert. Generate valid JSON only, no markdown formatting."),
-            HumanMessage(content=prompt)
-        ]
-
-        response = model.invoke(messages)
-        response_text = response.content if hasattr(response, 'content') else str(response)
-
-        # Strip markdown code fences if present
-        response_text = response_text.strip()
-        if response_text.startswith("```"):
-            lines = response_text.split("\n")
-            response_text = "\n".join(lines[1:-1]) if len(lines) > 2 else response_text
-            response_text = response_text.replace("```json", "").replace("```", "").strip()
-
-        graph = json.loads(response_text)
-
-        # Add default state fields to each node
-        for node_id, node_data in graph.get("nodes", {}).items():
-            node_data.setdefault("mastery_level", 0)
-            node_data.setdefault("last_tested", None)
-            node_data.setdefault("times_correct", 0)
-            node_data.setdefault("times_tested", 0)
-            node_data.setdefault("problem_step", 0)
-            node_data.setdefault("decay_score", 1.0)
-
-        # Validate DAG
-        if not validate_dag(graph.get("nodes", {})):
-            st.error("Generated graph contains cycles. Please try again.")
-            return None
-
-        return graph
-
-    except json.JSONDecodeError as e:
-        st.error(f"Failed to parse graph JSON: {e}")
-        return None
-    except Exception as e:
-        st.error(f"Graph generation error: {e}")
-        return None
-
-
-def get_mime_type(filename: str) -> str:
-    """Get MIME type based on file extension."""
-    ext = filename.lower().split(".")[-1] if "." in filename else ""
-    mime_types = {
-        "png": "image/png",
-        "jpg": "image/jpeg",
-        "jpeg": "image/jpeg",
-        "gif": "image/gif",
-        "webp": "image/webp",
-        "pdf": "application/pdf",
-    }
-    return mime_types.get(ext, "image/jpeg")
-
-
-def compress_image(image_bytes: bytes, max_dimension: int = 1024) -> bytes:
-    """Resize image so its longest side is at most max_dimension pixels."""
-    img = Image.open(io.BytesIO(image_bytes))
-    if max(img.size) > max_dimension:
-        img.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
-    buf = io.BytesIO()
-    fmt = img.format or "PNG"
-    img.save(buf, format=fmt)
-    return buf.getvalue()
-
-
-def validate_file_size(file_bytes: bytes, mime_type: str, filename: str) -> str | None:
-    """Return an error message if the file exceeds size limits, else None."""
-    size_mb = len(file_bytes) / (1024 * 1024)
-    if mime_type == "application/pdf":
-        if len(file_bytes) > MAX_PDF_SIZE_BYTES:
-            return f"PDF '{filename}' is {size_mb:.1f} MB. Maximum allowed is {MAX_PDF_SIZE_MB} MB."
-    else:
-        if len(file_bytes) > MAX_IMAGE_SIZE_BYTES:
-            return f"Image '{filename}' is {size_mb:.1f} MB. Maximum allowed is {MAX_IMAGE_SIZE_MB} MB."
-    return None
-
+# --- Model Management ---
 
 @st.cache_resource
 def get_model(provider: str, model_name: str, api_key: str = "", base_url: str = ""):
@@ -560,129 +149,6 @@ def get_model(provider: str, model_name: str, api_key: str = "", base_url: str =
     elif provider == "nvidia":
         return ChatOpenAI(model=model_name, api_key=api_key, base_url=base_url, temperature=0.5)
     return ChatGoogleGenerativeAI(model=model_name, temperature=0.5, google_api_key=api_key)
-
-
-KOKORO_MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.int8.onnx"
-KOKORO_VOICES_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
-
-KOKORO_EXPECTED_SIZES = {
-    "kokoro-v1.0.int8.onnx": 92361271,
-    "voices-v1.0.bin": 28214398,
-}
-
-
-def ensure_tts_files():
-    """Download TTS model files if needed, with progress feedback and atomic writes."""
-    cache_dir = Path.home() / ".cache" / "kokoro-onnx"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    model_path = cache_dir / "kokoro-v1.0.int8.onnx"
-    voices_path = cache_dir / "voices-v1.0.bin"
-
-    files_to_download = []
-    for url, path in [(KOKORO_MODEL_URL, model_path), (KOKORO_VOICES_URL, voices_path)]:
-        expected = KOKORO_EXPECTED_SIZES.get(path.name)
-        if not path.exists() or (expected and path.stat().st_size != expected):
-            if path.exists():
-                path.unlink()
-            files_to_download.append((url, path))
-        # Clean up any leftover .partial files from interrupted downloads
-        partial = path.with_suffix(path.suffix + ".partial")
-        if partial.exists():
-            partial.unlink()
-
-    if not files_to_download:
-        return
-
-    status = st.status("Downloading voice model (first time only)...", expanded=True)
-    for url, path in files_to_download:
-        label = path.name
-        status.update(label=f"Downloading {label}...")
-        resp = _requests_lib.get(url, stream=True, timeout=120)
-        resp.raise_for_status()
-        total = int(resp.headers.get("content-length", 0))
-        progress = status.progress(0, text=f"Downloading {label}...")
-        downloaded = 0
-        partial = path.with_suffix(path.suffix + ".partial")
-        with open(partial, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total:
-                    progress.progress(min(downloaded / total, 1.0),
-                                      text=f"Downloading {label}...")
-        partial.rename(path)
-        progress.progress(1.0, text=f"{label} complete")
-    status.update(label="Voice model ready!", state="complete", expanded=False)
-
-
-@st.cache_resource
-def get_tts_model():
-    """Load and cache the Kokoro TTS model (files must already exist on disk)."""
-    cache_dir = Path.home() / ".cache" / "kokoro-onnx"
-    return Kokoro(
-        str(cache_dir / "kokoro-v1.0.int8.onnx"),
-        str(cache_dir / "voices-v1.0.bin"),
-    )
-
-
-def strip_markdown(text: str) -> str:
-    """Remove markdown formatting so TTS reads clean prose."""
-    text = re.sub(r"```[\s\S]*?```", "", text)
-    text = re.sub(r"`[^`]+`", "", text)
-    # Convert LaTeX to spoken English instead of deleting it
-    text = re.sub(r"\$\$([\s\S]*?)\$\$", lambda m: latex_to_speakable(m.group(1)), text)
-    text = re.sub(r"\$([^$]+)\$", lambda m: latex_to_speakable(m.group(1)), text)
-    text = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", text)
-    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
-    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
-    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
-    text = re.sub(r"\*([^*]+)\*", r"\1", text)
-    text = re.sub(r"__([^_]+)__", r"\1", text)
-    text = re.sub(r"_([^_]+)_", r"\1", text)
-    text = re.sub(r"~~([^~]+)~~", r"\1", text)
-    text = re.sub(r"^[>\-\*]\s+", "", text, flags=re.MULTILINE)
-    text = re.sub(r"^\d+\.\s+", "", text, flags=re.MULTILINE)
-    text = re.sub(r"\n{2,}", "\n", text)
-    # Strip emoji from prose text
-    text = _EMOJI_RE.sub(" ", text)
-    # Convert Unicode math symbols outside LaTeX
-    for sym, spoken in UNICODE_MATH_MAP.items():
-        text = text.replace(sym, f" {spoken} ")
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
-def generate_tts(text: str) -> bytes | None:
-    """Generate WAV audio bytes from text using Kokoro TTS. Returns None on error."""
-    clean = strip_markdown(text)
-    if not clean:
-        return None
-    try:
-        ensure_tts_files()
-        tts = get_tts_model()
-        samples, sample_rate = tts.create(clean, voice="af_heart", speed=1.0, lang="en-us")
-        buf = io.BytesIO()
-        sf.write(buf, samples, sample_rate, format="WAV")
-        return buf.getvalue()
-    except Exception as e:
-        st.toast(f"TTS error: {e}", icon="⚠️")
-        return None
-
-
-def parse_tutor_log(text: str) -> tuple[str, dict | None]:
-    """Extract [TUTOR_LOG]...[/TUTOR_LOG] from response text.
-    Returns (clean_text, tutor_log_dict or None)."""
-    match = re.search(r'\[TUTOR_LOG\](.*?)\[/TUTOR_LOG\]', text, re.DOTALL)
-    if not match:
-        return text.strip(), None
-    log_text = match.group(1).strip()
-    log = {}
-    for line in log_text.splitlines():
-        if ':' in line:
-            key, _, val = line.partition(':')
-            log[key.strip()] = val.strip()
-    clean = text[:match.start()] + text[match.end():]
-    return clean.strip(), log
 
 
 def stream_response(
@@ -732,8 +198,9 @@ def stream_response(
             if msg["role"] == "user":
                 hist_content = [{"type": "text", "text": msg.get("content", "")}]
                 for f in msg.get("files", []):
-                    f_b64 = base64.b64encode(f["data"]).decode()
-                    hist_content.append(_image_part(f["mime_type"], f_b64))
+                    if "data_b64_cache" not in f:
+                        f["data_b64_cache"] = base64.b64encode(f["data"]).decode()
+                    hist_content.append(_image_part(f["mime_type"], f["data_b64_cache"]))
                 if msg.get("audio") and provider == "gemini":
                     hist_content.append({
                         "type": "media",
@@ -747,8 +214,9 @@ def stream_response(
         # Add current turn
         content = [{"type": "text", "text": user_query}]
         for f in file_attachments or []:
-            f_b64 = base64.b64encode(f["data"]).decode()
-            content.append(_image_part(f["mime_type"], f_b64))
+            if "data_b64_cache" not in f:
+                f["data_b64_cache"] = base64.b64encode(f["data"]).decode()
+            content.append(_image_part(f["mime_type"], f["data_b64_cache"]))
         if audio_data:
             if provider == "gemini":
                 content.append(
@@ -790,11 +258,7 @@ def stream_response(
                     )
                     if log_match:
                         log_text = log_match.group(1).strip()
-                        log = {}
-                        for line in log_text.splitlines():
-                            if ':' in line:
-                                k, _, v = line.partition(':')
-                                log[k.strip()] = v.strip()
+                        log = parse_log_fields(log_text)
                         st.session_state._pending_tutor_log = log
                     remainder = after.lstrip()
                     if remainder:
@@ -803,43 +267,48 @@ def stream_response(
             else:
                 yield chunk_text
 
-        if not log_done:
+        if not log_done and buffer:
             # Model didn't output tags — yield entire buffer as-is
             yield buffer
 
     except (PermissionDenied, InvalidArgument) as e:
         if "API key" in str(e).lower() or "api_key" in str(e).lower() or "permission" in str(e).lower():
-            st.error("Invalid API key. Please check your key and try again.")
+            st.session_state._stream_error = "Invalid API key. Please check your key and try again."
         else:
-            st.error(f"Request error: {e}")
+            st.session_state._stream_error = f"Request error: {e}"
+        return
     except ResourceExhausted:
-        st.error("Rate limited. Please wait a moment and try again.")
+        st.session_state._stream_error = "Rate limited. Please wait a moment and try again."
+        return
     except DeadlineExceeded:
-        st.error("Request timed out. Try a shorter question or smaller file.")
+        st.session_state._stream_error = "Request timed out. Try a shorter question or smaller file."
+        return
     except (ServiceUnavailable, RequestsConnectionError):
-        st.error("Connection failed. Check your internet connection and try again.")
+        st.session_state._stream_error = "Connection failed. Check your internet connection and try again."
+        return
     except Exception as e:
         error_msg = str(e).lower()
         if "api key" in error_msg or "api_key" in error_msg or "unauthorized" in error_msg:
-            st.error("Invalid API key. Please check your key and try again.")
+            st.session_state._stream_error = "Invalid API key. Please check your key and try again."
         elif "rate" in error_msg and "limit" in error_msg:
-            st.error("Rate limited. Please wait a moment and try again.")
+            st.session_state._stream_error = "Rate limited. Please wait a moment and try again."
         elif "timeout" in error_msg:
-            st.error("Request timed out. Try a shorter question or smaller file.")
+            st.session_state._stream_error = "Request timed out. Try a shorter question or smaller file."
         elif provider == "ollama" and ("refused" in error_msg or "connect" in error_msg):
-            st.error("Cannot connect to Ollama. Make sure it's running (`ollama serve`).")
+            st.session_state._stream_error = "Cannot connect to Ollama. Make sure it's running (`ollama serve`)."
         elif provider == "ollama" and "not found" in error_msg:
-            st.error(f"Model '{model_name}' not found. Run: `ollama pull {model_name}`")
+            st.session_state._stream_error = f"Model '{model_name}' not found. Run: `ollama pull {model_name}`"
         elif provider == "nvidia" and ("401" in error_msg or "unauthorized" in error_msg):
-            st.error("Invalid NVIDIA API key. Get one at https://build.nvidia.com/")
+            st.session_state._stream_error = "Invalid NVIDIA API key. Get one at https://build.nvidia.com/"
         elif provider == "nvidia" and ("429" in error_msg or "rate" in error_msg):
-            st.error("⚠️ NVIDIA rate limit hit. Free-tier keys allow ~5 requests/min. Wait 60 seconds and try again.")
+            st.session_state._stream_error = "⚠️ NVIDIA rate limit hit. Free-tier keys allow ~5 requests/min. Wait 60 seconds and try again."
         elif provider == "nvidia" and ("402" in error_msg or "payment" in error_msg or "credit" in error_msg):
-            st.error("NVIDIA API credits exhausted. Check your account at https://build.nvidia.com/")
+            st.session_state._stream_error = "NVIDIA API credits exhausted. Check your account at https://build.nvidia.com/"
         elif "connect" in error_msg or "network" in error_msg:
-            st.error("Connection failed. Check your internet connection and try again.")
+            st.session_state._stream_error = "Connection failed. Check your internet connection and try again."
         else:
-            st.error(f"An error occurred: {e}")
+            st.session_state._stream_error = f"An error occurred: {e}"
+        return
 
 
 # --- Streamlit Page Configuration ---
@@ -1002,44 +471,55 @@ st.markdown("""
 st.title("📚 StudyBuddy")
 st.caption("Your AI-powered tutoring assistant")
 
-# --- Load System Prompt from Secrets ---
+# --- Load System Prompt Template from Secrets ---
 try:
-    base_system_prompt = st.secrets["SYSTEM_PROMPT"]
+    _system_prompt_template = st.secrets["SYSTEM_PROMPT"]
 except (KeyError, FileNotFoundError):
     st.warning("SYSTEM_PROMPT not found in secrets.toml. Using a default prompt.")
-    base_system_prompt = (
+    _system_prompt_template = (
         "You are a helpful and patient tutor. Help the student understand concepts, "
         "work through problems step-by-step, and encourage their learning progress."
     )
 
+def build_system_prompt(subject_name: str) -> str:
+    """Build final system prompt by filling in subject-specific content."""
+    config = get_subject_config(subject_name)
+    prompt = _system_prompt_template
+    for key, value in config.items():
+        prompt = prompt.replace(f"{{{key}}}", str(value))
+    return prompt
+
 # --- Chat History Initialization ---
 def get_default_greeting(has_graph: bool) -> dict:
     """Generate appropriate greeting based on whether knowledge graph exists."""
-    if has_graph:
+    subject = st.session_state.get("active_subject", DEFAULT_SUBJECT)
+    config = get_subject_config(subject)
+    icon = config["icon"]
+    examples = config["greeting_examples"]
+
+    if KG_ENABLED and has_graph:
         return {
             "role": "assistant",
             "content": (
-                "**Welcome back!** I've loaded your knowledge map. "
+                f"**Welcome back!** {icon} I've loaded your {subject} knowledge map. "
                 "Ready to continue where we left off? Just say 'yes' or ask a question to begin."
             ),
         }
     else:
+        kg_hint = "\n\n**Or generate a Knowledge Map** from the sidebar to start structured learning!" if KG_ENABLED else ""
         return {
             "role": "assistant",
             "content": (
-                "**Welcome to StudyBuddy!** I'm your AI tutor — here to help you learn, "
+                f"**Welcome to StudyBuddy!** {icon} I'm your AI tutor — here to help you learn, "
                 "not just give answers.\n\n"
                 "Here's what I can do:\n"
                 "- **Explain concepts** step-by-step with guided questions\n"
                 "- **Work through problems** together (show me a photo of your homework!)\n"
                 "- **Analyze images & diagrams** — just attach a file or use the drawing tools\n"
                 "- **Listen to your voice** — tap the mic to ask a question out loud\n\n"
-                "**Try one of these to get started:**\n"
-                '- "Explain the difference between ionic and covalent bonds"\n'
-                '- "Help me balance this equation: Fe + O\u2082 \u2192 Fe\u2082O\u2083"\n'
-                "- \"What does $E = mc^2$ really mean?\"\n"
-                '- Attach a photo of a problem you\'re stuck on\n\n'
-                "**Or generate a Knowledge Map** from the sidebar to start structured learning!"
+                f"**Try one of these {subject} questions to get started:**\n"
+                f"- {examples}\n"
+                '- Attach a photo of a problem you\'re stuck on' + kg_hint
             ),
         }
 
@@ -1050,15 +530,33 @@ if "canvas_version" not in st.session_state:
 if "tldraw_version" not in st.session_state:
     st.session_state.tldraw_version = 0
 
-if "knowledge_graph" not in st.session_state:
-    st.session_state.knowledge_graph = load_graph()
-
-if "active_node" not in st.session_state:
-    # Auto-select first node if graph exists
-    if st.session_state.knowledge_graph:
-        st.session_state.active_node = get_next_node(st.session_state.knowledge_graph)
-    else:
+# KG integration point 1: Session init
+if KG_ENABLED:
+    from knowledge_graph import load_graph, get_next_node
+    if "knowledge_graph" not in st.session_state:
+        st.session_state.knowledge_graph = load_graph(get_graph_file_path())
+    if "active_node" not in st.session_state:
+        # Auto-select first node if graph exists
+        if st.session_state.knowledge_graph:
+            st.session_state.active_node = get_next_node(st.session_state.knowledge_graph)
+        else:
+            st.session_state.active_node = None
+else:
+    if "knowledge_graph" not in st.session_state:
+        st.session_state.knowledge_graph = None
+    if "active_node" not in st.session_state:
         st.session_state.active_node = None
+
+# Subject initialization (after KG load, so we can infer from saved graph)
+if "active_subject" not in st.session_state:
+    if st.session_state.knowledge_graph and st.session_state.knowledge_graph.get("subject"):
+        kg_sub = st.session_state.knowledge_graph["subject"]
+        # Fuzzy match: if graph says "Chemistry", "chemistry", or "Chem", select Chemistry
+        st.session_state.active_subject = next(
+            (s for s in SUBJECT_NAMES if s.lower() in kg_sub.lower()), DEFAULT_SUBJECT
+        )
+    else:
+        st.session_state.active_subject = DEFAULT_SUBJECT
 
 # --- Sidebar: Configuration ---
 with st.sidebar:
@@ -1132,114 +630,42 @@ with st.sidebar:
     tts_enabled = st.toggle("Read aloud", key="tts_enabled")
     st.divider()
 
-    # --- Knowledge Map Section ---
-    st.markdown("#### :blue[Knowledge Map]")
-
-    if st.session_state.knowledge_graph is None:
-        subject_input = st.text_input("Subject:", value="Chemistry", key="subject_input")
-        if st.button("Generate Map", use_container_width=True):
-            active_api_key = nvidia_api_key if provider_key == "nvidia" else google_api_key
-            if provider_key in ("nvidia", "gemini") and not active_api_key:
-                st.error("Please provide your API Key first.")
-            else:
-                with st.spinner(f"Generating {subject_input} knowledge graph..."):
-                    base_url_param = DEFAULT_NVIDIA_BASE_URL if provider_key == "nvidia" else st.session_state.get("ollama_base_url", DEFAULT_OLLAMA_BASE_URL)
-                    model = get_model(provider_key, model_name, api_key=active_api_key,
-                                    base_url=base_url_param)
-                    graph = generate_graph(model, subject_input)
-                    if graph:
-                        st.session_state.knowledge_graph = graph
-                        save_graph(graph)
-                        # Auto-select first node
-                        st.session_state.active_node = get_next_node(graph)
-                        st.success(f"Created {len(graph['nodes'])} nodes!")
-                        st.rerun()
-    else:
-        graph = st.session_state.knowledge_graph
-        nodes = graph.get("nodes", {})
-
-        # Progress bar
-        mastered_count = sum(1 for n in nodes.values() if compute_node_state(n) == "mastered")
-        total_count = len(nodes)
-        progress = mastered_count / total_count if total_count > 0 else 0
-        st.progress(progress, text=f"Progress: {mastered_count}/{total_count}")
-
-        # Node list
-        st.caption(f"**{graph.get('subject', 'Knowledge Graph')}**")
-
-        # Build topological order
-        ts = graphlib.TopologicalSorter()
-        for node_id, node_data in nodes.items():
-            deps = node_data.get("deps", [])
-            ts.add(node_id, *deps)
-        topo_order = list(ts.static_order())
-
-        # Display nodes
-        for node_id in topo_order:
-            node = nodes[node_id]
-            state = compute_node_state(node)
-            locked = is_node_locked(node_id, graph)
-
-            # Choose emoji
-            if state == "mastered":
-                emoji = "🟢"
-            elif state == "failing":
-                emoji = "🔴"
-            elif locked:
-                emoji = "🔒"
-            else:
-                emoji = "🟡"
-
-            # Active indicator
-            indicator = " ●" if node_id == st.session_state.active_node else ""
-
-            # Button label
-            label = f"{emoji} {node['label']}{indicator}"
-
-            # Step indicator for active node
-            if node_id == st.session_state.active_node:
-                step = node.get("problem_step", 0)
-                if step > 0:
-                    label += f" [{step}/3]"
-
-            if st.button(label, key=f"node_{node_id}", disabled=locked, use_container_width=True):
-                st.session_state.active_node = node_id
-                # Inject a navigation prompt
-                nav_msg = {
-                    "role": "user",
-                    "content": f"[NAVIGATE TO NODE: {node_id}]",
-                    "timestamp": datetime.now().isoformat()
-                }
-                st.session_state.messages.append(nav_msg)
-                st.rerun()
-
-        # Review-due section
-        review_due = [nid for nid in nodes if compute_node_state(nodes[nid]) == "mastered" and nodes[nid].get("decay_score", 1.0) < 0.5]
-        if review_due:
-            st.divider()
-            st.caption("🔄 **Review Needed**")
-            for nid in review_due[:3]:
-                node = nodes[nid]
-                if st.button(f"🔄 {node['label']}", key=f"review_{nid}", use_container_width=True):
-                    st.session_state.active_node = nid
-                    st.rerun()
-
-        st.divider()
-        if st.button("Reset Map", use_container_width=True):
-            graph_file = get_graph_file_path()
-            if graph_file.exists():
-                graph_file.unlink()
-            st.session_state.knowledge_graph = None
-            st.session_state.active_node = None
-            st.rerun()
-
+    # --- Subject Selector ---
+    st.markdown("#### :blue[Subject]")
+    selected_subject = st.selectbox(
+        "Subject", SUBJECT_NAMES,
+        index=SUBJECT_NAMES.index(st.session_state.active_subject),
+        format_func=lambda s: f"{get_subject_config(s)['icon']} {s}",
+        key="subject_selector", label_visibility="collapsed",
+    )
+    if selected_subject != st.session_state.active_subject:
+        st.session_state.active_subject = selected_subject
     st.divider()
+
+    # --- Knowledge Map Section ---
+    # KG integration point 2: Sidebar
+    if KG_ENABLED:
+        from knowledge_graph import render_sidebar
+        active_api_key = nvidia_api_key if provider_key == "nvidia" else google_api_key
+        if provider_key == "nvidia":
+            base_url_param = DEFAULT_NVIDIA_BASE_URL
+        elif provider_key == "ollama":
+            base_url_param = st.session_state.get("ollama_base_url", DEFAULT_OLLAMA_BASE_URL)
+        else:
+            base_url_param = ""
+        render_sidebar(provider_key, model_name, active_api_key, base_url_param, get_graph_file_path(), get_model)
+        st.divider()
+
+
     if st.button("New Chat", use_container_width=True):
         has_graph = st.session_state.knowledge_graph is not None
         st.session_state.messages = [get_default_greeting(has_graph)]
         chat_file = get_chat_file_path()
         if chat_file.exists():
             chat_file.unlink()
+        keys_to_delete = [k for k in st.session_state.keys() if k.startswith("tts_cache_")]
+        for k in keys_to_delete:
+            del st.session_state[k]
         st.rerun()
 
 if "messages" not in st.session_state:
@@ -1260,6 +686,9 @@ if "auto_start_needed" not in st.session_state:
 
 # --- Display Chat History ---
 for idx, message in enumerate(st.session_state.messages):
+    if message.get("content", "").startswith("[NAVIGATE TO NODE:"):
+        continue
+
     with st.chat_message(message["role"]):
         for f in message.get("files", []):
             if f.get("type", "image") == "image":
@@ -1304,7 +733,10 @@ with toggle_cols[0]:
 with toggle_cols[1]:
     show_tldraw = st.toggle("🖊️ Whiteboard", key="show_tldraw")
 with toggle_cols[2]:
-    show_ketcher = st.toggle("⚗️ Molecules", key="show_ketcher")
+    if st.session_state.get("active_subject") == "Chemistry":
+        show_ketcher = st.toggle("⚗️ Molecules", key="show_ketcher")
+    else:
+        show_ketcher = False
 
 canvas_result = None
 if show_canvas:
@@ -1338,9 +770,14 @@ result = st.chat_input(
     accept_audio=True,
 )
 if result:
+    if '_pending_tutor_log' in st.session_state:
+        del st.session_state._pending_tutor_log
+
     prompt = result.text or ""
     files = result.files or []
     audio = result.audio
+
+    last_canvas_v = st.session_state.get("last_canvas_submitted", -1)
 
     # Process files
     file_attachments = []
@@ -1363,7 +800,8 @@ if result:
 
     # Process canvas drawing
     if canvas_result is not None and canvas_result.json_data is not None:
-        if len(canvas_result.json_data.get("objects", [])) > 0:
+        if (len(canvas_result.json_data.get("objects", [])) > 0
+                and st.session_state.canvas_version != last_canvas_v):
             img = Image.fromarray(canvas_result.image_data.astype("uint8"), "RGBA")
             img = img.convert("RGB")
             buf = io.BytesIO()
@@ -1376,16 +814,19 @@ if result:
             })
 
     # Process tldraw whiteboard
+    display_prompt = prompt
     if tldraw_result is not None:
         snapshot = tldraw_result if isinstance(tldraw_result, dict) else {}
         shapes = snapshot.get("shapes", snapshot.get("objects", []))
         if shapes:
             tldraw_json = json.dumps(snapshot, default=str)
             prompt = f"[Whiteboard content: {tldraw_json}]\n\n{prompt}"
+            display_prompt = f"[Whiteboard attached]\n\n{display_prompt}" if display_prompt else "[Whiteboard attached]"
 
     # Process ketcher molecule editor
     if ketcher_smiles and ketcher_smiles.strip():
         prompt = f"[Molecule SMILES: {ketcher_smiles.strip()}]\n\n{prompt}"
+        display_prompt = f"[Molecule structure attached]\n\n{display_prompt}" if display_prompt else "[Molecule structure attached]"
 
     # Process audio
     audio_data = None
@@ -1410,25 +851,31 @@ if result:
                 st.info(f"📄 PDF: {f['name']}")
         if audio_data:
             st.audio(audio_data, format="audio/wav")
-        if prompt:
-            st.markdown(prompt)
+        if display_prompt:
+            st.markdown(display_prompt)
 
     # Stream assistant response
     with st.chat_message("assistant"):
         # Build graph context if available
         graph_ctx = ""
-        if st.session_state.knowledge_graph and st.session_state.active_node:
+        if KG_ENABLED and st.session_state.knowledge_graph and st.session_state.active_node:
+            from knowledge_graph import build_graph_context
             graph_ctx = build_graph_context(st.session_state.knowledge_graph, st.session_state.active_node)
 
         active_api_key = nvidia_api_key if provider_key == "nvidia" else google_api_key
-        base_url_param = DEFAULT_NVIDIA_BASE_URL if provider_key == "nvidia" else st.session_state.get("ollama_base_url", DEFAULT_OLLAMA_BASE_URL)
+        if provider_key == "nvidia":
+            base_url_param = DEFAULT_NVIDIA_BASE_URL
+        elif provider_key == "ollama":
+            base_url_param = st.session_state.get("ollama_base_url", DEFAULT_OLLAMA_BASE_URL)
+        else:
+            base_url_param = ""
 
         response = st.write_stream(
             stream_response(
                 prompt,
                 provider_key,
                 model_name,
-                base_system_prompt,
+                build_system_prompt(st.session_state.active_subject),
                 api_key=active_api_key,
                 base_url=base_url_param,
                 file_attachments=file_attachments or None,
@@ -1437,43 +884,51 @@ if result:
                 graph_context=graph_ctx,
             )
         )
-        if response:
-            msg = {"role": "assistant", "content": response, "timestamp": datetime.now().isoformat()}
-            if '_pending_tutor_log' in st.session_state:
-                tutor_log = st.session_state._pending_tutor_log
-                msg["tutor_log"] = tutor_log
-                del st.session_state._pending_tutor_log
 
-                # Update knowledge graph if applicable
-                if st.session_state.knowledge_graph and tutor_log.get("node"):
-                    update_node_from_log(st.session_state.knowledge_graph, tutor_log)
-                    save_graph(st.session_state.knowledge_graph)
+    if "_stream_error" in st.session_state:
+        st.error(st.session_state._stream_error)
+        del st.session_state._stream_error
+    elif response:
+        # Safety net: strip any TUTOR_LOG that slipped through streaming
+        clean_response, extracted_log = parse_tutor_log(response)
+        clean_response = normalize_markdown_newlines(clean_response)
+        msg = {"role": "assistant", "content": clean_response, "timestamp": datetime.now().isoformat()}
 
-                    # Auto-advance if mastered
-                    if tutor_log.get("node_verdict") == "mastered":
-                        next_node = get_next_node(st.session_state.knowledge_graph)
-                        if next_node:
-                            st.session_state.active_node = next_node
-                            st.toast(f"✅ Mastered! Moving to: {st.session_state.knowledge_graph['nodes'][next_node]['label']}")
+        if '_pending_tutor_log' in st.session_state:
+            tutor_log = st.session_state._pending_tutor_log
+            msg["tutor_log"] = tutor_log
+            del st.session_state._pending_tutor_log
+        elif extracted_log:
+            # Fallback: use extracted log if streaming didn't capture it
+            msg["tutor_log"] = extracted_log
+            st.session_state._pending_tutor_log = extracted_log
 
-                    # Apply decay to all mastered nodes
-                    for node in st.session_state.knowledge_graph.get("nodes", {}).values():
-                        if compute_node_state(node) == "mastered":
-                            node["decay_score"] = node.get("decay_score", 1.0) * 0.95
-                    save_graph(st.session_state.knowledge_graph)
+            # KG integration point 3: Post-response
+            if KG_ENABLED and extracted_log.get("node") and st.session_state.get("knowledge_graph"):
+                from knowledge_graph import process_tutor_response
+                process_tutor_response(extracted_log, get_graph_file_path())
 
-            st.session_state.messages.append(msg)
-            save_chat(st.session_state.messages)
-            if tts_enabled:
-                with st.spinner("Generating speech..."):
-                    tts_audio = generate_tts(response)
-                if tts_audio:
-                    tts_idx = len(st.session_state.messages) - 1
-                    st.session_state[f"tts_cache_{tts_idx}"] = tts_audio
-                    st.audio(tts_audio, format="audio/wav", autoplay=True)
+        # Handle tutor_log for KG updates (if it was already in _pending_tutor_log)
+        if msg.get("tutor_log"):
+            tutor_log = msg["tutor_log"]
+            # KG integration point 3: Post-response
+            if KG_ENABLED and tutor_log.get("node") and st.session_state.get("knowledge_graph"):
+                from knowledge_graph import process_tutor_response
+                process_tutor_response(tutor_log, get_graph_file_path())
+
+        st.session_state.messages.append(msg)
+        save_chat(st.session_state.messages)
+        if tts_enabled:
+            with st.spinner("Generating speech..."):
+                tts_audio = generate_tts(response)
+            if tts_audio:
+                tts_idx = len(st.session_state.messages) - 1
+                st.session_state[f"tts_cache_{tts_idx}"] = tts_audio
+                st.audio(tts_audio, format="audio/wav", autoplay=True)
 
     # Reset canvas and tldraw for next drawing
     st.session_state.canvas_version = st.session_state.canvas_version + 1
     st.session_state.tldraw_version = st.session_state.tldraw_version + 1
+    st.session_state.last_canvas_submitted = st.session_state.canvas_version
 
     st.rerun()
