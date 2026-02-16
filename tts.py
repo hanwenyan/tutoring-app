@@ -7,8 +7,6 @@ from pathlib import Path
 
 import streamlit as st
 import requests as _requests_lib
-import soundfile as sf
-from kokoro_onnx import Kokoro
 
 from utils import strip_markdown
 
@@ -21,9 +19,17 @@ KOKORO_EXPECTED_SIZES = {
     "voices-v1.0.bin": 28214398,
 }
 
+_TTS_FILES_VERIFIED = False
+
 
 def ensure_tts_files():
     """Download TTS model files if needed, with progress feedback and atomic writes."""
+    global _TTS_FILES_VERIFIED
+
+    # Skip filesystem checks after first successful verification
+    if _TTS_FILES_VERIFIED:
+        return
+
     cache_dir = Path.home() / ".cache" / "kokoro-onnx"
     cache_dir.mkdir(parents=True, exist_ok=True)
     model_path = cache_dir / "kokoro-v1.0.int8.onnx"
@@ -42,6 +48,7 @@ def ensure_tts_files():
             partial.unlink()
 
     if not files_to_download:
+        _TTS_FILES_VERIFIED = True
         return
 
     status = st.status("Downloading voice model (first time only)...", expanded=True)
@@ -54,21 +61,28 @@ def ensure_tts_files():
         progress = status.progress(0, text=f"Downloading {label}...")
         downloaded = 0
         partial = path.with_suffix(path.suffix + ".partial")
+        last_percent = -1
         with open(partial, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
+            for chunk in resp.iter_content(chunk_size=262144):  # 256KB chunks
                 f.write(chunk)
                 downloaded += len(chunk)
                 if total:
-                    progress.progress(min(downloaded / total, 1.0),
-                                      text=f"Downloading {label}...")
+                    percent = int(downloaded * 100 / total)
+                    # Update progress only every 1% to reduce overhead
+                    if percent > last_percent:
+                        progress.progress(min(downloaded / total, 1.0),
+                                          text=f"Downloading {label}...")
+                        last_percent = percent
         partial.rename(path)
         progress.progress(1.0, text=f"{label} complete")
     status.update(label="Voice model ready!", state="complete", expanded=False)
+    _TTS_FILES_VERIFIED = True
 
 
 @st.cache_resource
 def get_tts_model():
     """Load and cache the Kokoro TTS model (files must already exist on disk)."""
+    from kokoro_onnx import Kokoro
     cache_dir = Path.home() / ".cache" / "kokoro-onnx"
     return Kokoro(
         str(cache_dir / "kokoro-v1.0.int8.onnx"),
@@ -78,6 +92,7 @@ def get_tts_model():
 
 def generate_tts(text: str) -> bytes | None:
     """Generate WAV audio bytes from text using Kokoro TTS. Returns None on error."""
+    import soundfile as sf
     clean = strip_markdown(text)
     if not clean:
         return None
