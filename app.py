@@ -14,22 +14,7 @@ import os
 import re
 
 import streamlit as st
-from PIL import Image
-from streamlit_drawable_canvas import st_canvas
-from streamlit_tldraw import st_tldraw
-from streamlit_ketcher import st_ketcher
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_ollama import ChatOllama
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from google.api_core.exceptions import (
-    InvalidArgument,
-    PermissionDenied,
-    ResourceExhausted,
-    ServiceUnavailable,
-    DeadlineExceeded,
-)
-from requests.exceptions import ConnectionError as RequestsConnectionError
 
 from utils import (
     MODEL_NAME,
@@ -43,6 +28,8 @@ from utils import (
     parse_tutor_log,
     parse_log_fields,
     normalize_markdown_newlines,
+    convert_latex_delimiters,
+    stream_with_latex_conversion,
 )
 from tts import generate_tts
 from subjects import SUBJECT_NAMES, DEFAULT_SUBJECT, get_subject_config
@@ -70,11 +57,15 @@ def get_session_id() -> str:
 
 
 
+_created_dirs = set()
+
 def get_data_dir() -> Path:
     """Return the per-session data directory, creating it if needed."""
     sid = get_session_id()
     data_dir = Path(__file__).parent / "data" / sid
-    data_dir.mkdir(parents=True, exist_ok=True)
+    if data_dir not in _created_dirs:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        _created_dirs.add(data_dir)
     return data_dir
 
 
@@ -97,10 +88,16 @@ def save_chat(messages: list):
             entry["files"] = []
             for f in msg["files"]:
                 serialized_file = {k: v for k, v in f.items() if k not in ("data", "data_b64_cache")}
-                serialized_file["data_b64"] = base64.b64encode(f["data"]).decode()
+                # Use cached base64 if available to avoid re-encoding
+                if "data_b64_cache" not in f:
+                    f["data_b64_cache"] = base64.b64encode(f["data"]).decode()
+                serialized_file["data_b64"] = f["data_b64_cache"]
                 entry["files"].append(serialized_file)
         if "audio" in msg:
-            entry["audio_b64"] = base64.b64encode(msg["audio"]).decode()
+            # Cache audio base64 as well
+            if "audio_b64_cache" not in msg:
+                msg["audio_b64_cache"] = base64.b64encode(msg["audio"]).decode()
+            entry["audio_b64"] = msg["audio_b64_cache"]
         serialized.append(entry)
     path = get_chat_file_path()
     fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
@@ -145,9 +142,12 @@ def load_chat() -> list | None:
 def get_model(provider: str, model_name: str, api_key: str = "", base_url: str = ""):
     """Create and cache a chat model instance for the given provider."""
     if provider == "ollama":
+        from langchain_ollama import ChatOllama
         return ChatOllama(model=model_name, base_url=base_url, temperature=0.5, num_ctx=16384)
     elif provider == "nvidia":
+        from langchain_openai import ChatOpenAI
         return ChatOpenAI(model=model_name, api_key=api_key, base_url=base_url, temperature=0.5)
+    from langchain_google_genai import ChatGoogleGenerativeAI
     return ChatGoogleGenerativeAI(model=model_name, temperature=0.5, google_api_key=api_key)
 
 
@@ -271,22 +271,33 @@ def stream_response(
             # Model didn't output tags — yield entire buffer as-is
             yield buffer
 
-    except (PermissionDenied, InvalidArgument) as e:
-        if "API key" in str(e).lower() or "api_key" in str(e).lower() or "permission" in str(e).lower():
-            st.session_state._stream_error = "Invalid API key. Please check your key and try again."
-        else:
-            st.session_state._stream_error = f"Request error: {e}"
-        return
-    except ResourceExhausted:
-        st.session_state._stream_error = "Rate limited. Please wait a moment and try again."
-        return
-    except DeadlineExceeded:
-        st.session_state._stream_error = "Request timed out. Try a shorter question or smaller file."
-        return
-    except (ServiceUnavailable, RequestsConnectionError):
-        st.session_state._stream_error = "Connection failed. Check your internet connection and try again."
-        return
     except Exception as e:
+        from google.api_core.exceptions import (
+            InvalidArgument,
+            PermissionDenied,
+            ResourceExhausted,
+            ServiceUnavailable,
+            DeadlineExceeded,
+        )
+        from requests.exceptions import ConnectionError as RequestsConnectionError
+
+        if isinstance(e, (PermissionDenied, InvalidArgument)):
+            if "API key" in str(e).lower() or "api_key" in str(e).lower() or "permission" in str(e).lower():
+                st.session_state._stream_error = "Invalid API key. Please check your key and try again."
+            else:
+                st.session_state._stream_error = f"Request error: {e}"
+            return
+        elif isinstance(e, ResourceExhausted):
+            st.session_state._stream_error = "Rate limited. Please wait a moment and try again."
+            return
+        elif isinstance(e, DeadlineExceeded):
+            st.session_state._stream_error = "Request timed out. Try a shorter question or smaller file."
+            return
+        elif isinstance(e, (ServiceUnavailable, RequestsConnectionError)):
+            st.session_state._stream_error = "Connection failed. Check your internet connection and try again."
+            return
+
+        # Fall through to generic error handling below
         error_msg = str(e).lower()
         if "api key" in error_msg or "api_key" in error_msg or "unauthorized" in error_msg:
             st.session_state._stream_error = "Invalid API key. Please check your key and try again."
@@ -707,7 +718,16 @@ for idx, message in enumerate(st.session_state.messages):
                     st.markdown(f"**{k}:** {v}")
         if message["role"] == "assistant" and tts_enabled and message.get("content"):
             cache_key = f"tts_cache_{idx}"
-            if st.button("🔊 Read aloud", key=f"tts_btn_{idx}"):
+            # Auto-generate TTS for pending message after rerun
+            if "_tts_pending_idx" in st.session_state and st.session_state._tts_pending_idx == idx:
+                del st.session_state._tts_pending_idx
+                if cache_key not in st.session_state:
+                    with st.spinner("Generating speech..."):
+                        st.session_state[cache_key] = generate_tts(message["content"])
+                audio_bytes = st.session_state.get(cache_key)
+                if audio_bytes:
+                    st.audio(audio_bytes, format="audio/wav", autoplay=True)
+            elif st.button("🔊 Read aloud", key=f"tts_btn_{idx}"):
                 if cache_key not in st.session_state:
                     with st.spinner("Generating speech..."):
                         st.session_state[cache_key] = generate_tts(message["content"])
@@ -740,6 +760,7 @@ with toggle_cols[2]:
 
 canvas_result = None
 if show_canvas:
+    from streamlit_drawable_canvas import st_canvas
     canvas_result = st_canvas(
         stroke_width=3,
         stroke_color="#000000",
@@ -753,6 +774,7 @@ if show_canvas:
 
 tldraw_result = None
 if show_tldraw:
+    from streamlit_tldraw import st_tldraw
     tldraw_result = st_tldraw(
         height=300,
         key=f"tldraw_{st.session_state.tldraw_version}",
@@ -760,6 +782,7 @@ if show_tldraw:
 
 ketcher_smiles = None
 if show_ketcher:
+    from streamlit_ketcher import st_ketcher
     ketcher_smiles = st_ketcher("")
 
 # --- User Input and Response Handling ---
@@ -802,6 +825,7 @@ if result:
     if canvas_result is not None and canvas_result.json_data is not None:
         if (len(canvas_result.json_data.get("objects", [])) > 0
                 and st.session_state.canvas_version != last_canvas_v):
+            from PIL import Image
             img = Image.fromarray(canvas_result.image_data.astype("uint8"), "RGBA")
             img = img.convert("RGB")
             buf = io.BytesIO()
@@ -871,17 +895,19 @@ if result:
             base_url_param = ""
 
         response = st.write_stream(
-            stream_response(
-                prompt,
-                provider_key,
-                model_name,
-                build_system_prompt(st.session_state.active_subject),
-                api_key=active_api_key,
-                base_url=base_url_param,
-                file_attachments=file_attachments or None,
-                audio_data=audio_data,
-                chat_history=st.session_state.messages[:-1],
-                graph_context=graph_ctx,
+            stream_with_latex_conversion(
+                stream_response(
+                    prompt,
+                    provider_key,
+                    model_name,
+                    build_system_prompt(st.session_state.active_subject),
+                    api_key=active_api_key,
+                    base_url=base_url_param,
+                    file_attachments=file_attachments or None,
+                    audio_data=audio_data,
+                    chat_history=st.session_state.messages[:-1],
+                    graph_context=graph_ctx,
+                )
             )
         )
 
@@ -891,40 +917,31 @@ if result:
     elif response:
         # Safety net: strip any TUTOR_LOG that slipped through streaming
         clean_response, extracted_log = parse_tutor_log(response)
+        clean_response = convert_latex_delimiters(clean_response)
         clean_response = normalize_markdown_newlines(clean_response)
         msg = {"role": "assistant", "content": clean_response, "timestamp": datetime.now().isoformat()}
 
+        # Unified tutor_log handling to fix double process_tutor_response bug
         if '_pending_tutor_log' in st.session_state:
             tutor_log = st.session_state._pending_tutor_log
-            msg["tutor_log"] = tutor_log
             del st.session_state._pending_tutor_log
         elif extracted_log:
-            # Fallback: use extracted log if streaming didn't capture it
-            msg["tutor_log"] = extracted_log
-            st.session_state._pending_tutor_log = extracted_log
+            tutor_log = extracted_log
+        else:
+            tutor_log = None
 
-            # KG integration point 3: Post-response
-            if KG_ENABLED and extracted_log.get("node") and st.session_state.get("knowledge_graph"):
-                from knowledge_graph import process_tutor_response
-                process_tutor_response(extracted_log, get_graph_file_path())
-
-        # Handle tutor_log for KG updates (if it was already in _pending_tutor_log)
-        if msg.get("tutor_log"):
-            tutor_log = msg["tutor_log"]
-            # KG integration point 3: Post-response
+        if tutor_log:
+            msg["tutor_log"] = tutor_log
+            # KG integration point 3: Post-response (only called once now)
             if KG_ENABLED and tutor_log.get("node") and st.session_state.get("knowledge_graph"):
                 from knowledge_graph import process_tutor_response
                 process_tutor_response(tutor_log, get_graph_file_path())
 
         st.session_state.messages.append(msg)
         save_chat(st.session_state.messages)
+        # Decouple TTS from rerun — set pending flag instead of blocking
         if tts_enabled:
-            with st.spinner("Generating speech..."):
-                tts_audio = generate_tts(response)
-            if tts_audio:
-                tts_idx = len(st.session_state.messages) - 1
-                st.session_state[f"tts_cache_{tts_idx}"] = tts_audio
-                st.audio(tts_audio, format="audio/wav", autoplay=True)
+            st.session_state["_tts_pending_idx"] = len(st.session_state.messages) - 1
 
     # Reset canvas and tldraw for next drawing
     st.session_state.canvas_version = st.session_state.canvas_version + 1

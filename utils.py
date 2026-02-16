@@ -5,7 +5,6 @@ No Streamlit dependencies — only standard library and PIL.
 
 import io
 import re
-from PIL import Image
 
 # --- Model Configuration ---
 MODEL_NAME = "gemini-3-flash-preview"
@@ -197,9 +196,12 @@ def get_mime_type(filename: str) -> str:
 
 def compress_image(image_bytes: bytes, max_dimension: int = 1024) -> bytes:
     """Resize image so its longest side is at most max_dimension pixels."""
+    from PIL import Image
     img = Image.open(io.BytesIO(image_bytes))
-    if max(img.size) > max_dimension:
-        img.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
+    # Early return if image already fits within max_dimension
+    if max(img.size) <= max_dimension:
+        return image_bytes
+    img.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
     buf = io.BytesIO()
     fmt = img.format or "PNG"
     img.save(buf, format=fmt)
@@ -282,9 +284,10 @@ def parse_tutor_log(text: str) -> tuple[str, dict | None]:
 
 _PROTECTED_BLOCK_RE = re.compile(
     r'(```[\s\S]*?```'
-    r'|\$\$[\s\S]*?\$\$)',
+    r'|\$\$[\s\S]*?\$\$'
+    r'|\$[^$\n]+\$)',
 )
-_INLINE_NUMBERED_RE = re.compile(r'(?<=\S)(?:[ \t]+|\n)(1\.\s)')
+_INLINE_NUMBERED_RE = re.compile(r'(?<=\S)(?:[ \t]+|\n)(\d+\.\s)')
 _INLINE_BULLET_RE = re.compile(r'(?<=\S)(?:[ \t]+|\n)([-*]\s)')
 _INLINE_BOLD_HEADER_RE = re.compile(r'(?<=\S)(?:[ \t]+|\n)(\*\*[^*]+:\*\*)')
 _INLINE_BOLD_STANDALONE_RE = re.compile(r'(?<=\S)(?:[ \t]+|\n)(\*\*[^*]+\*\*)\s*(?=\n|$)', re.MULTILINE)
@@ -320,3 +323,67 @@ def normalize_markdown_newlines(text: str) -> str:
         work = work.replace(f'\x00BLOCK{i}\x00', block)
 
     return work
+
+
+def convert_latex_delimiters(text: str) -> str:
+    """Convert LaTeX delimiters \(...\) → $...$ and \[...\] → $$...$$.
+
+    Protects code fences and inline code from modification.
+    Streamlit's KaTeX only recognizes $ delimiters, not \( \) \[ \].
+    """
+    # 1. Stash protected blocks
+    blocks: list[str] = []
+
+    def _stash(m: re.Match) -> str:
+        blocks.append(m.group(0))
+        return f'\x00BLOCK{len(blocks) - 1}\x00'
+
+    # Protect code fences and inline code
+    protected_re = re.compile(r'(```[\s\S]*?```|`[^`]+`)')
+    work = protected_re.sub(_stash, text)
+
+    # 2. Convert delimiters
+    work = work.replace(r'\(', '$')
+    work = work.replace(r'\)', '$')
+    work = work.replace(r'\[', '$$')
+    work = work.replace(r'\]', '$$')
+
+    # 3. Restore protected blocks
+    for i, block in enumerate(blocks):
+        work = work.replace(f'\x00BLOCK{i}\x00', block)
+
+    return work
+
+
+def stream_with_latex_conversion(generator):
+    """Wrap a text-chunk generator to convert LaTeX delimiters on-the-fly.
+
+    Buffers trailing backslash to handle delimiters split across chunk boundaries.
+    Safe to use on complete responses (converts \( but not \\ in code blocks).
+    """
+    buffer = ""
+
+    for chunk in generator:
+        # Append chunk to buffer
+        buffer += chunk
+
+        # If buffer ends with backslash, wait for next chunk to see what follows
+        if buffer.endswith('\\'):
+            continue
+
+        # Convert delimiters using simple replace (safe - \( doesn't appear in normal prose)
+        output = buffer.replace(r'\(', '$')
+        output = output.replace(r'\)', '$')
+        output = output.replace(r'\[', '$$')
+        output = output.replace(r'\]', '$$')
+
+        yield output
+        buffer = ""
+
+    # Flush remaining buffer
+    if buffer:
+        output = buffer.replace(r'\(', '$')
+        output = output.replace(r'\)', '$')
+        output = output.replace(r'\[', '$$')
+        output = output.replace(r'\]', '$$')
+        yield output
