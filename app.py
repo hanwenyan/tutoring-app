@@ -12,6 +12,7 @@ import secrets
 import tempfile
 import os
 import re
+import time
 
 import streamlit as st
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -27,10 +28,7 @@ from utils import (
     validate_file_size,
     parse_tutor_log,
     parse_log_fields,
-    normalize_markdown_newlines,
-    escape_currency_dollars,
-    convert_latex_delimiters,
-    stream_with_latex_conversion,
+    process_for_display,
     relative_time,
 )
 from tts import generate_tts
@@ -148,7 +146,10 @@ def get_model(provider: str, model_name: str, api_key: str = "", base_url: str =
         return ChatOllama(model=model_name, base_url=base_url, temperature=0.5, num_ctx=16384)
     elif provider == "nvidia":
         from langchain_openai import ChatOpenAI
-        return ChatOpenAI(model=model_name, api_key=api_key, base_url=base_url, temperature=0.5)
+        return ChatOpenAI(
+            model=model_name, api_key=api_key, base_url=base_url,
+            temperature=0.5, max_tokens=4096, timeout=60, max_retries=1,
+        )
     from langchain_google_genai import ChatGoogleGenerativeAI
     return ChatGoogleGenerativeAI(model=model_name, temperature=0.5, google_api_key=api_key)
 
@@ -195,20 +196,31 @@ def stream_response(
 
         messages = [SystemMessage(content=full_system_prompt)]
 
-        # Add prior conversation turns
-        for msg in (chat_history or []):
+        # Add prior conversation turns (sliding window to cap input tokens)
+        MAX_HISTORY_MESSAGES = 20
+        RECENT_FILES_MESSAGES = 4
+        full_history = chat_history or []
+        trimmed_history = full_history[-MAX_HISTORY_MESSAGES:]
+        files_cutoff_idx = len(trimmed_history) - RECENT_FILES_MESSAGES
+
+        for i, msg in enumerate(trimmed_history):
+            # Skip KG navigation synthetic messages — they waste context tokens
+            if msg["role"] == "user" and msg.get("content", "").startswith("[NAVIGATE TO NODE:"):
+                continue
             if msg["role"] == "user":
                 hist_content = [{"type": "text", "text": msg.get("content", "")}]
-                for f in msg.get("files", []):
-                    if "data_b64_cache" not in f:
-                        f["data_b64_cache"] = base64.b64encode(f["data"]).decode()
-                    hist_content.append(_image_part(f["mime_type"], f["data_b64_cache"]))
-                if msg.get("audio") and provider == "gemini":
-                    hist_content.append({
-                        "type": "media",
-                        "mime_type": "audio/wav",
-                        "data": msg["audio"],
-                    })
+                # Only include images/files for recent messages to reduce payload size
+                if i >= files_cutoff_idx:
+                    for f in msg.get("files", []):
+                        if "data_b64_cache" not in f:
+                            f["data_b64_cache"] = base64.b64encode(f["data"]).decode()
+                        hist_content.append(_image_part(f["mime_type"], f["data_b64_cache"]))
+                    if msg.get("audio") and provider == "gemini":
+                        hist_content.append({
+                            "type": "media",
+                            "mime_type": "audio/wav",
+                            "data": msg["audio"],
+                        })
                 messages.append(HumanMessage(content=hist_content))
             elif msg["role"] == "assistant" and msg.get("content"):
                 messages.append(AIMessage(content=msg["content"]))
@@ -235,8 +247,16 @@ def stream_response(
         response_stream = model.stream(messages)
         buffer = ""
         log_done = False
+        start_time = time.monotonic()
 
         for chunk in response_stream:
+            if time.monotonic() - start_time > 90:
+                # Timeout — yield whatever clean content we have and stop
+                if not log_done and buffer:
+                    cleaned = re.sub(r'\[TUTOR_LOG\][\s\S]*?(\[/TUTOR_LOG\])?', '', buffer).strip()
+                    if cleaned:
+                        yield cleaned
+                break
             # Extract text from chunk (same logic as before)
             chunk_text = ""
             if isinstance(chunk.content, str):
@@ -955,19 +975,17 @@ if result or regen:
         container = st.empty()
         full_response = ""
 
-        stream_iter = stream_with_latex_conversion(
-            stream_response(
-                prompt,
-                provider_key,
-                model_name,
-                build_system_prompt(st.session_state.active_subject),
-                api_key=active_api_key,
-                base_url=base_url_param,
-                file_attachments=file_attachments or None,
-                audio_data=audio_data,
-                chat_history=st.session_state.messages[:-1],
-                graph_context=graph_ctx,
-            )
+        stream_iter = stream_response(
+            prompt,
+            provider_key,
+            model_name,
+            build_system_prompt(st.session_state.active_subject),
+            api_key=active_api_key,
+            base_url=base_url_param,
+            file_attachments=file_attachments or None,
+            audio_data=audio_data,
+            chat_history=st.session_state.messages[:-1],
+            graph_context=graph_ctx,
         )
 
         with st.spinner("Thinking..."):
@@ -975,10 +993,10 @@ if result or regen:
 
         if first_chunk is not None:
             full_response = first_chunk
-            container.markdown(full_response)
+            container.markdown(process_for_display(full_response))
             for chunk in stream_iter:
                 full_response += chunk
-                container.markdown(full_response)
+                container.markdown(process_for_display(full_response))
 
         if not full_response:
             container.empty()
@@ -990,9 +1008,7 @@ if result or regen:
     elif response:
         # Safety net: strip any TUTOR_LOG that slipped through streaming
         clean_response, extracted_log = parse_tutor_log(response)
-        clean_response = escape_currency_dollars(clean_response)
-        clean_response = convert_latex_delimiters(clean_response)
-        clean_response = normalize_markdown_newlines(clean_response)
+        clean_response = process_for_display(clean_response, final=True)
         container.markdown(clean_response)
         msg = {"role": "assistant", "content": clean_response, "timestamp": datetime.now().isoformat()}
 

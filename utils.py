@@ -349,6 +349,87 @@ def escape_currency_dollars(text: str) -> str:
     return work
 
 
+def fix_multiline_inline_math(text: str) -> str:
+    """Join newlines inside $...$ inline math so KaTeX doesn't break mid-expression."""
+    blocks: list[str] = []
+
+    def _stash(m: re.Match) -> str:
+        blocks.append(m.group(0))
+        return f'\x00FIX{len(blocks) - 1}\x00'
+
+    # Stash code fences and display math ($$...$$) — don't touch these
+    stash_re = re.compile(r'(```[\s\S]*?```|\$\$[\s\S]*?\$\$)')
+    work = stash_re.sub(_stash, text)
+
+    # Replace newlines inside $...$ with a space
+    work = re.sub(r'\$([^$]+?)\$', lambda m: '$' + m.group(1).replace('\n', ' ') + '$', work)
+
+    for i, block in enumerate(blocks):
+        work = work.replace(f'\x00FIX{i}\x00', block)
+    return work
+
+
+def ensure_dollar_parity(text: str) -> str:
+    """Truncate text at the last unpaired $ to prevent KaTeX from consuming trailing content.
+
+    During streaming, a $..$ expression may be split across chunks. This prevents
+    the opening $ from being matched with a later unrelated $ in subsequent chunks.
+    No-ops on text where single-$ count is even (all pairs closed).
+    """
+    # Stash code fences and inline code to avoid counting their $ signs
+    blocks: list[str] = []
+
+    def _stash(m: re.Match) -> str:
+        blocks.append(m.group(0))
+        return f'\x00PAR{len(blocks) - 1}\x00'
+
+    stash_re = re.compile(r'(```[\s\S]*?```|`[^`]+`|\$\$[\s\S]*?\$\$)')
+    work = stash_re.sub(_stash, text)
+
+    # Find positions of single unescaped $
+    positions = []
+    i = 0
+    while i < len(work):
+        if work[i] == '$':
+            if i + 1 < len(work) and work[i + 1] == '$':
+                i += 2  # skip $$
+                continue
+            if i > 0 and work[i - 1] == '\\':
+                i += 1  # skip \$
+                continue
+            positions.append(i)
+        i += 1
+
+    if len(positions) % 2 == 1:
+        # Odd count — truncate at the last (unpaired) $
+        last_unpaired = positions[-1]
+        work = work[:last_unpaired]
+
+    for i, block in enumerate(blocks):
+        work = work.replace(f'\x00PAR{i}\x00', block)
+    return work
+
+
+def process_for_display(text: str, final: bool = False) -> str:
+    """Apply the full display processing pipeline to LLM response text.
+
+    During streaming (final=False): escapes currency, converts delimiters,
+    fixes multiline inline math, and truncates at unpaired $ to prevent
+    KaTeX from consuming in-progress expressions.
+
+    On final render (final=True): skips dollar-parity truncation and runs
+    normalize_markdown_newlines for proper paragraph breaks.
+    """
+    text = escape_currency_dollars(text)
+    text = convert_latex_delimiters(text)
+    text = fix_multiline_inline_math(text)
+    if not final:
+        text = ensure_dollar_parity(text)
+    if final:
+        text = normalize_markdown_newlines(text)
+    return text
+
+
 def convert_latex_delimiters(text: str) -> str:
     """Convert LaTeX delimiters \(...\) → $...$ and \[...\] → $$...$$.
 
@@ -402,35 +483,3 @@ def relative_time(iso_str: str) -> str:
         return iso_str[:16].replace("T", " ")
 
 
-def stream_with_latex_conversion(generator):
-    """Wrap a text-chunk generator to convert LaTeX delimiters on-the-fly.
-
-    Buffers trailing backslash to handle delimiters split across chunk boundaries.
-    Safe to use on complete responses (converts \( but not \\ in code blocks).
-    """
-    buffer = ""
-
-    for chunk in generator:
-        # Append chunk to buffer
-        buffer += chunk
-
-        # If buffer ends with backslash, wait for next chunk to see what follows
-        if buffer.endswith('\\'):
-            continue
-
-        # Convert delimiters using simple replace (safe - \( doesn't appear in normal prose)
-        output = buffer.replace(r'\(', '$')
-        output = output.replace(r'\)', '$')
-        output = output.replace(r'\[', '$$')
-        output = output.replace(r'\]', '$$')
-
-        yield output
-        buffer = ""
-
-    # Flush remaining buffer
-    if buffer:
-        output = buffer.replace(r'\(', '$')
-        output = output.replace(r'\)', '$')
-        output = output.replace(r'\[', '$$')
-        output = output.replace(r'\]', '$$')
-        yield output
