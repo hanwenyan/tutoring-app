@@ -28,8 +28,10 @@ from utils import (
     parse_tutor_log,
     parse_log_fields,
     normalize_markdown_newlines,
+    escape_currency_dollars,
     convert_latex_delimiters,
     stream_with_latex_conversion,
+    relative_time,
 )
 from tts import generate_tts
 from subjects import SUBJECT_NAMES, DEFAULT_SUBJECT, get_subject_config
@@ -138,7 +140,7 @@ def load_chat() -> list | None:
 
 # --- Model Management ---
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def get_model(provider: str, model_name: str, api_key: str = "", base_url: str = ""):
     """Create and cache a chat model instance for the given provider."""
     if provider == "ollama":
@@ -476,6 +478,24 @@ st.markdown("""
         padding-right: 1rem;
     }
 }
+
+/* Compact message action buttons */
+[data-testid="stChatMessage"] [data-testid="column"] .stPopover > button,
+[data-testid="stChatMessage"] [data-testid="column"] .stButton > button {
+    padding: 0.25rem 0.5rem;
+    min-height: 0;
+    border: none;
+    background: transparent;
+}
+[data-testid="stChatMessage"] [data-testid="column"] .stPopover > button:hover,
+[data-testid="stChatMessage"] [data-testid="column"] .stButton > button:hover {
+    background: rgba(0, 0, 0, 0.05);
+    border-radius: 6px;
+}
+/* Hide popover dropdown chevron inside chat messages */
+[data-testid="stChatMessage"] [data-testid="column"] .stPopover > button > svg {
+    display: none;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -571,113 +591,123 @@ if "active_subject" not in st.session_state:
 
 # --- Sidebar: Configuration ---
 with st.sidebar:
-    st.markdown("#### :blue[Model]")
-    provider = st.selectbox("Provider", ["NVIDIA API", "Gemini API", "Local (Ollama)"],
-                            key="provider", label_visibility="collapsed")
-
-    if provider == "NVIDIA API":
-        # Load from secrets, allow user override
-        secret_nvidia_key = ""
-        try:
-            secret_nvidia_key = st.secrets["NVIDIA_API_KEY"]
-        except (KeyError, FileNotFoundError):
-            pass
-
-        nvidia_api_key = st.text_input(
-            "NVIDIA API Key (optional — built-in key available)",
-            type="password", key="nvidia_api_key",
-            placeholder="Override with your own key"
-        )
-        # Use user's key if provided, else fall back to secret
-        nvidia_api_key = nvidia_api_key or secret_nvidia_key
-
-        if nvidia_api_key:
-            st.caption("✅ API key active")
-        else:
-            st.caption("⚠️ No API key. [Get one at nvidia.com](https://build.nvidia.com/)")
-        provider_key = "nvidia"
-        model_name = DEFAULT_NVIDIA_MODEL
-        google_api_key = ""
-    elif provider == "Gemini API":
-        # Load from secrets, allow user override
-        secret_google_key = ""
-        try:
-            secret_google_key = st.secrets["GOOGLE_API_KEY"]
-        except (KeyError, FileNotFoundError):
-            pass
-
-        google_api_key = st.text_input(
-            "Google API Key (optional — built-in key available)",
-            type="password", key="google_api_key",
-            placeholder="Override with your own key"
-        )
-        # Use user's key if provided, else fall back to secret
-        google_api_key = google_api_key or secret_google_key
-
-        if google_api_key:
-            st.caption("✅ API key active")
-        else:
-            st.caption("⚠️ No API key. [Get one at aistudio.google.com](https://aistudio.google.com/app/apikey)")
-        provider_key = "gemini"
-        model_name = MODEL_NAME
-        nvidia_api_key = ""
-    else:
-        ollama_model = st.text_input("Model name:", value=DEFAULT_OLLAMA_MODEL,
-                                      key="ollama_model")
-        ollama_url = st.text_input("Ollama URL:", value=DEFAULT_OLLAMA_BASE_URL,
-                                    key="ollama_base_url")
-        st.caption(
-            "Running remotely? Expose Ollama with "
-            "[ngrok](https://ngrok.com) (`ngrok http 11434`) "
-            "and paste the URL above."
-        )
-        google_api_key = ""
-        nvidia_api_key = ""
-        provider_key = "ollama"
-        model_name = ollama_model
-
+    # Create containers in VISUAL order
+    subject_container = st.container()
     st.divider()
-    st.markdown("#### :blue[Options]")
-    tts_enabled = st.toggle("Read aloud", key="tts_enabled")
+    kg_container = st.container()
     st.divider()
-
-    # --- Subject Selector ---
-    st.markdown("#### :blue[Subject]")
-    selected_subject = st.selectbox(
-        "Subject", SUBJECT_NAMES,
-        index=SUBJECT_NAMES.index(st.session_state.active_subject),
-        format_func=lambda s: f"{get_subject_config(s)['icon']} {s}",
-        key="subject_selector", label_visibility="collapsed",
-    )
-    if selected_subject != st.session_state.active_subject:
-        st.session_state.active_subject = selected_subject
+    options_container = st.container()
     st.divider()
+    newchat_container = st.container()
+    st.divider()
+    model_container = st.container()
 
-    # --- Knowledge Map Section ---
-    # KG integration point 2: Sidebar
-    if KG_ENABLED:
-        from knowledge_graph import render_sidebar
-        active_api_key = nvidia_api_key if provider_key == "nvidia" else google_api_key
-        if provider_key == "nvidia":
-            base_url_param = DEFAULT_NVIDIA_BASE_URL
-        elif provider_key == "ollama":
-            base_url_param = st.session_state.get("ollama_base_url", DEFAULT_OLLAMA_BASE_URL)
-        else:
-            base_url_param = ""
-        render_sidebar(provider_key, model_name, active_api_key, base_url_param, get_graph_file_path(), get_model)
-        st.divider()
+    # Fill MODEL first (sets provider_key, model_name, api keys — needed by KG)
+    with model_container:
+        with st.expander("⚙️ Model Settings", expanded=False):
+            provider = st.selectbox("Provider", ["NVIDIA API", "Gemini API", "Local (Ollama)"],
+                                    key="provider", label_visibility="collapsed")
 
+            if provider == "NVIDIA API":
+                secret_nvidia_key = ""
+                try:
+                    secret_nvidia_key = st.secrets["NVIDIA_API_KEY"]
+                except (KeyError, FileNotFoundError):
+                    pass
 
-    if st.button("New Chat", use_container_width=True):
-        has_graph = st.session_state.knowledge_graph is not None
-        st.session_state.messages = [get_default_greeting(has_graph)]
-        chat_file = get_chat_file_path()
-        if chat_file.exists():
-            chat_file.unlink()
-        keys_to_delete = [k for k in st.session_state.keys() if k.startswith("tts_cache_")]
-        for k in keys_to_delete:
-            del st.session_state[k]
-        st.rerun()
+                nvidia_api_key = st.text_input(
+                    "NVIDIA API Key (optional — built-in key available)",
+                    type="password", key="nvidia_api_key",
+                    placeholder="Override with your own key"
+                )
+                nvidia_api_key = nvidia_api_key or secret_nvidia_key
+
+                if nvidia_api_key:
+                    st.caption("✅ API key active")
+                else:
+                    st.caption("⚠️ No API key. [Get one at nvidia.com](https://build.nvidia.com/)")
+                provider_key = "nvidia"
+                model_name = DEFAULT_NVIDIA_MODEL
+                google_api_key = ""
+            elif provider == "Gemini API":
+                secret_google_key = ""
+                try:
+                    secret_google_key = st.secrets["GOOGLE_API_KEY"]
+                except (KeyError, FileNotFoundError):
+                    pass
+
+                google_api_key = st.text_input(
+                    "Google API Key (optional — built-in key available)",
+                    type="password", key="google_api_key",
+                    placeholder="Override with your own key"
+                )
+                google_api_key = google_api_key or secret_google_key
+
+                if google_api_key:
+                    st.caption("✅ API key active")
+                else:
+                    st.caption("⚠️ No API key. [Get one at aistudio.google.com](https://aistudio.google.com/app/apikey)")
+                provider_key = "gemini"
+                model_name = MODEL_NAME
+                nvidia_api_key = ""
+            else:
+                ollama_model = st.text_input("Model name:", value=DEFAULT_OLLAMA_MODEL,
+                                              key="ollama_model")
+                ollama_url = st.text_input("Ollama URL:", value=DEFAULT_OLLAMA_BASE_URL,
+                                            key="ollama_base_url")
+                st.caption(
+                    "Running remotely? Expose Ollama with "
+                    "[ngrok](https://ngrok.com) (`ngrok http 11434`) "
+                    "and paste the URL above."
+                )
+                google_api_key = ""
+                nvidia_api_key = ""
+                provider_key = "ollama"
+                model_name = ollama_model
+
+    # Fill SUBJECT
+    with subject_container:
+        st.markdown("#### :blue[Subject]")
+        selected_subject = st.selectbox(
+            "Subject", SUBJECT_NAMES,
+            index=SUBJECT_NAMES.index(st.session_state.active_subject),
+            format_func=lambda s: f"{get_subject_config(s)['icon']} {s}",
+            key="subject_selector", label_visibility="collapsed",
+        )
+        if selected_subject != st.session_state.active_subject:
+            st.session_state.active_subject = selected_subject
+
+    # Fill KG
+    with kg_container:
+        # KG integration point 2: Sidebar
+        if KG_ENABLED:
+            from knowledge_graph import render_sidebar
+            active_api_key = nvidia_api_key if provider_key == "nvidia" else google_api_key
+            if provider_key == "nvidia":
+                base_url_param = DEFAULT_NVIDIA_BASE_URL
+            elif provider_key == "ollama":
+                base_url_param = st.session_state.get("ollama_base_url", DEFAULT_OLLAMA_BASE_URL)
+            else:
+                base_url_param = ""
+            render_sidebar(provider_key, model_name, active_api_key, base_url_param, get_graph_file_path(), get_model)
+
+    # Fill OPTIONS
+    with options_container:
+        st.markdown("#### :blue[Options]")
+        tts_enabled = st.toggle("Read aloud", key="tts_enabled")
+
+    # Fill NEW CHAT
+    with newchat_container:
+        if st.button("New Chat", use_container_width=True):
+            has_graph = st.session_state.knowledge_graph is not None
+            st.session_state.messages = [get_default_greeting(has_graph)]
+            chat_file = get_chat_file_path()
+            if chat_file.exists():
+                chat_file.unlink()
+            keys_to_delete = [k for k in st.session_state.keys() if k.startswith("tts_cache_")]
+            for k in keys_to_delete:
+                del st.session_state[k]
+            st.rerun()
 
 if "messages" not in st.session_state:
     saved = load_chat()
@@ -710,8 +740,26 @@ for idx, message in enumerate(st.session_state.messages):
             st.audio(message["audio"], format="audio/wav")
         if message.get("content"):
             st.markdown(message["content"])
+        if message["role"] == "assistant" and message.get("content"):
+            action_cols = st.columns([2, 2, 3, 11], gap="small")
+            with action_cols[0]:
+                with st.popover("", icon=":material/content_copy:"):
+                    st.code(message["content"], language=None)
+            with action_cols[1]:
+                assistant_indices = [i for i, m in enumerate(st.session_state.messages) if m["role"] == "assistant"]
+                is_last_assistant = bool(assistant_indices) and idx == assistant_indices[-1]
+                if is_last_assistant:
+                    if st.button("", icon=":material/refresh:", key=f"regen_{idx}"):
+                        st.session_state.messages.pop()
+                        cache_key = f"tts_cache_{idx}"
+                        if cache_key in st.session_state:
+                            del st.session_state[cache_key]
+                        st.session_state._regenerate = True
+                        st.rerun()
+            with action_cols[2]:
+                st.feedback("thumbs", key=f"fb_{idx}")
         if message.get("timestamp"):
-            st.caption(message["timestamp"][:16].replace("T", " "))
+            st.caption(relative_time(message["timestamp"]))
         if message["role"] == "assistant" and message.get("tutor_log"):
             with st.expander("Tutor reasoning", icon="🧠"):
                 for k, v in message["tutor_log"].items():
@@ -746,44 +794,45 @@ if st.session_state.auto_start_needed:
         st.rerun()
 
 # --- Drawing Canvas ---
-st.caption("TOOLS")
-toggle_cols = st.columns(3)
-with toggle_cols[0]:
-    show_canvas = st.toggle("✏️ Draw", key="show_canvas")
-with toggle_cols[1]:
-    show_tldraw = st.toggle("🖊️ Whiteboard", key="show_tldraw")
-with toggle_cols[2]:
-    if st.session_state.get("active_subject") == "Chemistry":
-        show_ketcher = st.toggle("⚗️ Molecules", key="show_ketcher")
-    else:
-        show_ketcher = False
-
 canvas_result = None
-if show_canvas:
-    from streamlit_drawable_canvas import st_canvas
-    canvas_result = st_canvas(
-        stroke_width=3,
-        stroke_color="#000000",
-        background_color="#FFFFFF",
-        height=250,
-        drawing_mode="freedraw",
-        display_toolbar=True,
-        update_streamlit=True,
-        key=f"canvas_{st.session_state.canvas_version}",
-    )
-
 tldraw_result = None
-if show_tldraw:
-    from streamlit_tldraw import st_tldraw
-    tldraw_result = st_tldraw(
-        height=300,
-        key=f"tldraw_{st.session_state.tldraw_version}",
-    )
-
 ketcher_smiles = None
-if show_ketcher:
-    from streamlit_ketcher import st_ketcher
-    ketcher_smiles = st_ketcher("")
+
+with st.expander("🛠️ Tools", expanded=False):
+    toggle_cols = st.columns(3)
+    with toggle_cols[0]:
+        show_canvas = st.toggle("✏️ Draw", key="show_canvas")
+    with toggle_cols[1]:
+        show_tldraw = st.toggle("🖊️ Whiteboard", key="show_tldraw")
+    with toggle_cols[2]:
+        if st.session_state.get("active_subject") == "Chemistry":
+            show_ketcher = st.toggle("⚗️ Molecules", key="show_ketcher")
+        else:
+            show_ketcher = False
+
+    if show_canvas:
+        from streamlit_drawable_canvas import st_canvas
+        canvas_result = st_canvas(
+            stroke_width=3,
+            stroke_color="#000000",
+            background_color="#FFFFFF",
+            height=250,
+            drawing_mode="freedraw",
+            display_toolbar=True,
+            update_streamlit=True,
+            key=f"canvas_{st.session_state.canvas_version}",
+        )
+
+    if show_tldraw:
+        from streamlit_tldraw import st_tldraw
+        tldraw_result = st_tldraw(
+            height=300,
+            key=f"tldraw_{st.session_state.tldraw_version}",
+        )
+
+    if show_ketcher:
+        from streamlit_ketcher import st_ketcher
+        ketcher_smiles = st_ketcher("")
 
 # --- User Input and Response Handling ---
 result = st.chat_input(
@@ -792,91 +841,100 @@ result = st.chat_input(
     file_type=["png", "jpg", "jpeg", "gif", "webp", "pdf"],
     accept_audio=True,
 )
-if result:
+regen = st.session_state.pop("_regenerate", False)
+if result or regen:
     if '_pending_tutor_log' in st.session_state:
         del st.session_state._pending_tutor_log
 
-    prompt = result.text or ""
-    files = result.files or []
-    audio = result.audio
+    if regen:
+        # Re-use the last user message (assistant was already popped)
+        last_user = st.session_state.messages[-1]
+        prompt = last_user["content"]
+        file_attachments = last_user.get("files", [])
+        audio_data = last_user.get("audio")
+        display_prompt = prompt
+    else:
+        prompt = result.text or ""
+        files = result.files or []
+        audio = result.audio
 
-    last_canvas_v = st.session_state.get("last_canvas_submitted", -1)
+        last_canvas_v = st.session_state.get("last_canvas_submitted", -1)
 
-    # Process files
-    file_attachments = []
-    for f in files:
-        file_bytes = f.getvalue()
-        mime = get_mime_type(f.name)
-        is_pdf = mime == "application/pdf"
-        size_err = validate_file_size(file_bytes, mime, f.name)
-        if size_err:
-            st.error(size_err)
-            continue
-        if not is_pdf:
-            file_bytes = compress_image(file_bytes)
-        file_attachments.append({
-            "data": file_bytes,
-            "mime_type": mime,
-            "name": f.name,
-            "type": "pdf" if is_pdf else "image",
-        })
-
-    # Process canvas drawing
-    if canvas_result is not None and canvas_result.json_data is not None:
-        if (len(canvas_result.json_data.get("objects", [])) > 0
-                and st.session_state.canvas_version != last_canvas_v):
-            from PIL import Image
-            img = Image.fromarray(canvas_result.image_data.astype("uint8"), "RGBA")
-            img = img.convert("RGB")
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
+        # Process files
+        file_attachments = []
+        for f in files:
+            file_bytes = f.getvalue()
+            mime = get_mime_type(f.name)
+            is_pdf = mime == "application/pdf"
+            size_err = validate_file_size(file_bytes, mime, f.name)
+            if size_err:
+                st.error(size_err)
+                continue
+            if not is_pdf:
+                file_bytes = compress_image(file_bytes)
             file_attachments.append({
-                "data": buf.getvalue(),
-                "mime_type": "image/png",
-                "name": "drawing.png",
-                "type": "image",
+                "data": file_bytes,
+                "mime_type": mime,
+                "name": f.name,
+                "type": "pdf" if is_pdf else "image",
             })
 
-    # Process tldraw whiteboard
-    display_prompt = prompt
-    if tldraw_result is not None:
-        snapshot = tldraw_result if isinstance(tldraw_result, dict) else {}
-        shapes = snapshot.get("shapes", snapshot.get("objects", []))
-        if shapes:
-            tldraw_json = json.dumps(snapshot, default=str)
-            prompt = f"[Whiteboard content: {tldraw_json}]\n\n{prompt}"
-            display_prompt = f"[Whiteboard attached]\n\n{display_prompt}" if display_prompt else "[Whiteboard attached]"
+        # Process canvas drawing
+        if canvas_result is not None and canvas_result.json_data is not None:
+            if (len(canvas_result.json_data.get("objects", [])) > 0
+                    and st.session_state.canvas_version != last_canvas_v):
+                from PIL import Image
+                img = Image.fromarray(canvas_result.image_data.astype("uint8"), "RGBA")
+                img = img.convert("RGB")
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                file_attachments.append({
+                    "data": buf.getvalue(),
+                    "mime_type": "image/png",
+                    "name": "drawing.png",
+                    "type": "image",
+                })
 
-    # Process ketcher molecule editor
-    if ketcher_smiles and ketcher_smiles.strip():
-        prompt = f"[Molecule SMILES: {ketcher_smiles.strip()}]\n\n{prompt}"
-        display_prompt = f"[Molecule structure attached]\n\n{display_prompt}" if display_prompt else "[Molecule structure attached]"
+        # Process tldraw whiteboard
+        display_prompt = prompt
+        if tldraw_result is not None:
+            snapshot = tldraw_result if isinstance(tldraw_result, dict) else {}
+            shapes = snapshot.get("shapes", snapshot.get("objects", []))
+            if shapes:
+                tldraw_json = json.dumps(snapshot, default=str)
+                prompt = f"[Whiteboard content: {tldraw_json}]\n\n{prompt}"
+                display_prompt = f"[Whiteboard attached]\n\n{display_prompt}" if display_prompt else "[Whiteboard attached]"
 
-    # Process audio
-    audio_data = None
-    if audio:
-        audio_data = audio.getvalue()
+        # Process ketcher molecule editor
+        if ketcher_smiles and ketcher_smiles.strip():
+            prompt = f"[Molecule SMILES: {ketcher_smiles.strip()}]\n\n{prompt}"
+            display_prompt = f"[Molecule structure attached]\n\n{display_prompt}" if display_prompt else "[Molecule structure attached]"
 
-    # Build user message for history
-    user_message = {"role": "user", "content": prompt, "timestamp": datetime.now().isoformat()}
-    if file_attachments:
-        user_message["files"] = file_attachments
-    if audio_data:
-        user_message["audio"] = audio_data
+        # Process audio
+        audio_data = None
+        if audio:
+            audio_data = audio.getvalue()
 
-    st.session_state.messages.append(user_message)
-
-    # Display user message
-    with st.chat_message("user"):
-        for f in file_attachments:
-            if f["type"] == "image":
-                st.image(f["data"], width=200)
-            else:
-                st.info(f"📄 PDF: {f['name']}")
+        # Build user message for history
+        user_message = {"role": "user", "content": prompt, "timestamp": datetime.now().isoformat()}
+        if file_attachments:
+            user_message["files"] = file_attachments
         if audio_data:
-            st.audio(audio_data, format="audio/wav")
-        if display_prompt:
-            st.markdown(display_prompt)
+            user_message["audio"] = audio_data
+
+        st.session_state.messages.append(user_message)
+
+        # Display user message
+        with st.chat_message("user"):
+            for f in file_attachments:
+                if f["type"] == "image":
+                    st.image(f["data"], width=200)
+                else:
+                    st.info(f"📄 PDF: {f['name']}")
+            if audio_data:
+                st.audio(audio_data, format="audio/wav")
+            if display_prompt:
+                st.markdown(display_prompt)
 
     # Stream assistant response
     with st.chat_message("assistant"):
@@ -894,22 +952,37 @@ if result:
         else:
             base_url_param = ""
 
-        response = st.write_stream(
-            stream_with_latex_conversion(
-                stream_response(
-                    prompt,
-                    provider_key,
-                    model_name,
-                    build_system_prompt(st.session_state.active_subject),
-                    api_key=active_api_key,
-                    base_url=base_url_param,
-                    file_attachments=file_attachments or None,
-                    audio_data=audio_data,
-                    chat_history=st.session_state.messages[:-1],
-                    graph_context=graph_ctx,
-                )
+        container = st.empty()
+        full_response = ""
+
+        stream_iter = stream_with_latex_conversion(
+            stream_response(
+                prompt,
+                provider_key,
+                model_name,
+                build_system_prompt(st.session_state.active_subject),
+                api_key=active_api_key,
+                base_url=base_url_param,
+                file_attachments=file_attachments or None,
+                audio_data=audio_data,
+                chat_history=st.session_state.messages[:-1],
+                graph_context=graph_ctx,
             )
         )
+
+        with st.spinner("Thinking..."):
+            first_chunk = next(stream_iter, None)
+
+        if first_chunk is not None:
+            full_response = first_chunk
+            container.markdown(full_response)
+            for chunk in stream_iter:
+                full_response += chunk
+                container.markdown(full_response)
+
+        if not full_response:
+            container.empty()
+        response = full_response
 
     if "_stream_error" in st.session_state:
         st.error(st.session_state._stream_error)
@@ -917,8 +990,10 @@ if result:
     elif response:
         # Safety net: strip any TUTOR_LOG that slipped through streaming
         clean_response, extracted_log = parse_tutor_log(response)
+        clean_response = escape_currency_dollars(clean_response)
         clean_response = convert_latex_delimiters(clean_response)
         clean_response = normalize_markdown_newlines(clean_response)
+        container.markdown(clean_response)
         msg = {"role": "assistant", "content": clean_response, "timestamp": datetime.now().isoformat()}
 
         # Unified tutor_log handling to fix double process_tutor_response bug

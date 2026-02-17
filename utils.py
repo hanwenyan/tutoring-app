@@ -316,12 +316,36 @@ def normalize_markdown_newlines(text: str) -> str:
     work = _INLINE_BOLD_HEADER_RE.sub(r'\n\n\1', work)        # "text **Hdr:**" → break
     work = _INLINE_BOLD_STANDALONE_RE.sub(r'\n\n\1', work)    # "text **Hdr**\n" → break
     work = _INLINE_HEADING_RE.sub(r'\n\n\1', work)            # "text ## Hdr" → break
+    # Clamp h1/h2 to h3 (too large for chat bubbles)
+    work = re.sub(r'^#{1,2}(\s)', r'###\1', work, flags=re.MULTILINE)
+    # Repair orphaned list markers (broken by inline-break regexes above)
+    work = re.sub(r'^(\s*[-*])[ \t]*\n\n+', r'\1 ', work, flags=re.MULTILINE)
+    work = re.sub(r'^(\s*\d+\.)[ \t]*\n\n+', r'\1 ', work, flags=re.MULTILINE)
     work = re.sub(r'\n{3,}', '\n\n', work)                    # final cleanup
 
     # 3. Restore protected blocks
     for i, block in enumerate(blocks):
         work = work.replace(f'\x00BLOCK{i}\x00', block)
 
+    return work
+
+
+_CURRENCY_RE = re.compile(r'\$(\d[\d,]*(?:\.\d{1,2})?)(?=[\s,;:.!?)\]}\-—\'"]|$)')
+_PROTECTED_CURRENCY_RE = re.compile(r'(```[\s\S]*?```|`[^`]+`|\$\$[\s\S]*?\$\$|\\\([\s\S]*?\\\))')
+
+
+def escape_currency_dollars(text: str) -> str:
+    """Escape dollar signs that are currency (e.g. $110, $5.99) to prevent LaTeX rendering."""
+    blocks: list[str] = []
+
+    def _stash(m: re.Match) -> str:
+        blocks.append(m.group(0))
+        return f'\x00CURR{len(blocks) - 1}\x00'
+
+    work = _PROTECTED_CURRENCY_RE.sub(_stash, text)
+    work = _CURRENCY_RE.sub(r'\\$\1', work)
+    for i, b in enumerate(blocks):
+        work = work.replace(f'\x00CURR{i}\x00', b)
     return work
 
 
@@ -353,6 +377,29 @@ def convert_latex_delimiters(text: str) -> str:
         work = work.replace(f'\x00BLOCK{i}\x00', block)
 
     return work
+
+
+def relative_time(iso_str: str) -> str:
+    """Convert ISO timestamp to relative time string."""
+    from datetime import datetime
+    try:
+        ts = datetime.fromisoformat(iso_str)
+        delta = datetime.now() - ts
+        seconds = delta.total_seconds()
+        if seconds < 60:
+            return "just now"
+        elif seconds < 3600:
+            mins = int(seconds // 60)
+            return f"{mins} min ago"
+        elif seconds < 86400:
+            hours = int(seconds // 3600)
+            return f"{hours} {'hour' if hours == 1 else 'hours'} ago"
+        elif seconds < 172800:
+            return "yesterday"
+        else:
+            return ts.strftime("%b %d") if ts.year == datetime.now().year else ts.strftime("%b %d, %Y")
+    except (ValueError, TypeError):
+        return iso_str[:16].replace("T", " ")
 
 
 def stream_with_latex_conversion(generator):
