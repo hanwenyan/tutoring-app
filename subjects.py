@@ -20,15 +20,17 @@ SUBJECTS = {
         "icon": "⚗️",
         "diagnostic_example": '"To solve this stoichiometry problem, start by writing the balanced equation. What reactants and products do you have?"',
         "topic_field_label": "chemistry topic being discussed",
-        "latex_examples": """Common notation: subscripts for chemical formulas ($H_2O$, $CO_2$), superscripts for charges ($Ca^{2+}$, $SO_4^{2-}$), arrows for reactions ($\\to$, $\\rightleftharpoons$).
+        "latex_examples": """Common notation: subscripts for chemical formulas \(H_2O\), \(CO_2\), superscripts for charges \(Ca^{2+}\), \(SO_4^{2-}\), arrows for reactions \(\\to\), \(\\rightleftharpoons\).
 
 For chemistry, write element symbols and formulas in regular math mode, NOT text mode:
-- ✅ CORRECT: $4Fe + 3O_2 \\to 2Fe_2O_3$
-- ❌ WRONG: $4\\text{Fe} + 3\\text{O}_2 \\to 2\\text{Fe}_2\\text{O}_3$
+- ✅ CORRECT: \(4Fe + 3O_2 \\to 2Fe_2O_3\)
+- ❌ WRONG: \(4\\text{Fe} + 3\\text{O}_2 \\to 2\\text{Fe}_2\\text{O}_3\)
 
 Keep subscripts/superscripts in math mode. Only use `\\text{}` for full words like units or labels:
-- ✅ CORRECT: $n = \\frac{m}{M} \\text{ (moles)}$
-- ❌ WRONG: $\\text{n} = \\frac{\\text{m}}{\\text{M}}$""",
+- ✅ CORRECT: \(n = \\frac{m}{M} \\text{ (moles)}\)
+- ❌ WRONG: \(\\text{n} = \\frac{\\text{m}}{\\text{M}}\)
+
+For display equations: \[2Mg + O_2 \\to 2MgO\]""",
         "real_world_examples": "stoichiometry → baking ratios and cooking; gas laws → scuba diving and weather balloons; redox reactions → phone batteries and corrosion; equilibrium → soda carbonation",
         "ambiguity_example": '"Are you stuck on the math part (like unit conversion) or the chemistry concept (like what a limiting reactant is)?"',
         "kg_problem_examples": """
@@ -66,17 +68,19 @@ For chemistry: use real compounds, balanced equations, and SI units. K-8: simple
         "icon": "📐",
         "diagnostic_example": '"To solve this equation, what operation would undo adding 5? Walk me through your first step."',
         "topic_field_label": "math topic being discussed",
-        "latex_examples": """Common notation: fractions ($\\frac{a}{b}$), exponents ($x^2$, $2^{10}$), radicals ($\\sqrt{x}$, $\\sqrt[3]{27}$), equations ($2x + 5 = 17$).
+        "latex_examples": """Common notation: fractions \(\\frac{a}{b}\), exponents \(x^2\), \(2^{10}\), radicals \(\\sqrt{x}\), \(\\sqrt[3]{27}\), equations \(2x + 5 = 17\).
 
 For algebra and calculus:
-- ✅ CORRECT: $f(x) = \\frac{x^2 - 4}{x + 2}$, $\\int_0^1 x^2 dx$, $\\lim_{x \\to 0} \\frac{\\sin x}{x}$
-- Use proper notation: $\\triangle ABC$ for triangles, $\\angle BAC$ for angles, $\\overline{AB}$ for line segments
+- ✅ CORRECT: \(f(x) = \\frac{x^2 - 4}{x + 2}\), \(\\int_0^1 x^2\\,dx\), \(\\lim_{x \\to 0} \\frac{\\sin x}{x}\)
+- Use proper notation: \(\\triangle ABC\) for triangles, \(\\angle BAC\) for angles, \(\\overline{AB}\) for line segments
 
-For inequalities: $\\leq$, $\\geq$, $<$, $>$
+For inequalities: \(\\leq\), \(\\geq\), \(<\), \(>\)
 
 Keep variables and numbers in math mode. Use `\\text{}` only for full words:
-- ✅ CORRECT: $A = \\pi r^2 \\text{ (area of circle)}$
-- ❌ WRONG: $\\text{A} = \\text{π}\\text{r}^\\text{2}$""",
+- ✅ CORRECT: \(A = \\pi r^2 \\text{ (area of circle)}\)
+- ❌ WRONG: \(\\text{A} = \\text{π}\\text{r}^\\text{2}\)
+
+For display equations: \[x = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}\]""",
         "real_world_examples": "linear equations → budgeting and unit pricing; geometry → architecture and design; statistics → polling and data analysis; calculus → physics motion and optimization",
         "ambiguity_example": '"Are you stuck on how to set up the equation, or on solving the algebra once you have it?"',
         "kg_problem_examples": """

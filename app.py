@@ -520,7 +520,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📚 StudyBuddy")
-st.caption("Your AI-powered tutoring assistant")
+_header_subject = st.session_state.get("active_subject", DEFAULT_SUBJECT)
+_header_icon = get_subject_config(_header_subject)["icon"]
+st.caption(f"{_header_icon} {_header_subject} · AI Tutoring Assistant")
 
 # --- Load System Prompt Template from Secrets ---
 try:
@@ -561,16 +563,11 @@ def get_default_greeting(has_graph: bool) -> dict:
         return {
             "role": "assistant",
             "content": (
-                f"**Welcome to StudyBuddy!** {icon} I'm your AI tutor — here to help you learn, "
-                "not just give answers.\n\n"
-                "Here's what I can do:\n"
-                "- **Explain concepts** step-by-step with guided questions\n"
-                "- **Work through problems** together (show me a photo of your homework!)\n"
-                "- **Analyze images & diagrams** — just attach a file or use the drawing tools\n"
-                "- **Listen to your voice** — tap the mic to ask a question out loud\n\n"
-                f"**Try one of these {subject} questions to get started:**\n"
+                f"**Welcome to StudyBuddy!** {icon} I'm your AI tutor — ask me anything, "
+                "share a photo of your homework, or try the drawing tools.\n\n"
+                f"**{subject} question ideas:**\n"
                 f"- {examples}\n"
-                '- Attach a photo of a problem you\'re stuck on' + kg_hint
+                f"- Attach a photo of a problem you're stuck on{kg_hint}"
             ),
         }
 
@@ -580,6 +577,8 @@ if "canvas_version" not in st.session_state:
     st.session_state.canvas_version = 0
 if "tldraw_version" not in st.session_state:
     st.session_state.tldraw_version = 0
+if "tts_cache_keys" not in st.session_state:
+    st.session_state.tts_cache_keys = set()
 
 # KG integration point 1: Session init
 if KG_ENABLED:
@@ -612,13 +611,13 @@ if "active_subject" not in st.session_state:
 # --- Sidebar: Configuration ---
 with st.sidebar:
     # Create containers in VISUAL order
+    newchat_container = st.container()
+    st.divider()
     subject_container = st.container()
     st.divider()
     kg_container = st.container()
     st.divider()
     options_container = st.container()
-    st.divider()
-    newchat_container = st.container()
     st.divider()
     model_container = st.container()
 
@@ -718,16 +717,29 @@ with st.sidebar:
 
     # Fill NEW CHAT
     with newchat_container:
-        if st.button("New Chat", use_container_width=True):
-            has_graph = st.session_state.knowledge_graph is not None
-            st.session_state.messages = [get_default_greeting(has_graph)]
-            chat_file = get_chat_file_path()
-            if chat_file.exists():
-                chat_file.unlink()
-            keys_to_delete = [k for k in st.session_state.keys() if k.startswith("tts_cache_")]
-            for k in keys_to_delete:
-                del st.session_state[k]
-            st.rerun()
+        if not st.session_state.get("_confirm_new_chat"):
+            if st.button("New Chat", use_container_width=True):
+                st.session_state._confirm_new_chat = True
+                st.rerun()
+        else:
+            st.warning("Clear all chat history?")
+            _nc1, _nc2 = st.columns(2)
+            with _nc1:
+                if st.button("Yes, clear", type="primary", use_container_width=True):
+                    del st.session_state._confirm_new_chat
+                    has_graph = st.session_state.knowledge_graph is not None
+                    st.session_state.messages = [get_default_greeting(has_graph)]
+                    chat_file = get_chat_file_path()
+                    if chat_file.exists():
+                        chat_file.unlink()
+                    for k in st.session_state.tts_cache_keys:
+                        st.session_state.pop(k, None)
+                    st.session_state.tts_cache_keys = set()
+                    st.rerun()
+            with _nc2:
+                if st.button("Cancel", use_container_width=True):
+                    del st.session_state._confirm_new_chat
+                    st.rerun()
 
 if "messages" not in st.session_state:
     saved = load_chat()
@@ -746,6 +758,7 @@ if "auto_start_needed" not in st.session_state:
     )
 
 # --- Display Chat History ---
+assistant_indices = [i for i, m in enumerate(st.session_state.messages) if m["role"] == "assistant"]
 for idx, message in enumerate(st.session_state.messages):
     if message.get("content", "").startswith("[NAVIGATE TO NODE:"):
         continue
@@ -753,7 +766,7 @@ for idx, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
         for f in message.get("files", []):
             if f.get("type", "image") == "image":
-                st.image(f["data"], width=200)
+                st.image(f["data"], width=400)
             else:
                 st.info(f"📄 PDF: {f['name']}")
         if message.get("audio"):
@@ -761,14 +774,16 @@ for idx, message in enumerate(st.session_state.messages):
         if message.get("content"):
             st.markdown(message["content"])
         if message["role"] == "assistant" and message.get("content"):
-            action_cols = st.columns([2, 2, 3, 11], gap="small")
+            is_last_assistant = bool(assistant_indices) and idx == assistant_indices[-1]
+            if is_last_assistant:
+                action_cols = st.columns([2, 2, 3, 11], gap="small")
+            else:
+                action_cols = st.columns([2, 3, 11], gap="small")
             with action_cols[0]:
                 with st.popover("", icon=":material/content_copy:"):
                     st.code(message["content"], language=None)
-            with action_cols[1]:
-                assistant_indices = [i for i, m in enumerate(st.session_state.messages) if m["role"] == "assistant"]
-                is_last_assistant = bool(assistant_indices) and idx == assistant_indices[-1]
-                if is_last_assistant:
+            if is_last_assistant:
+                with action_cols[1]:
                     if st.button("", icon=":material/refresh:", key=f"regen_{idx}"):
                         st.session_state.messages.pop()
                         cache_key = f"tts_cache_{idx}"
@@ -776,15 +791,26 @@ for idx, message in enumerate(st.session_state.messages):
                             del st.session_state[cache_key]
                         st.session_state._regenerate = True
                         st.rerun()
-            with action_cols[2]:
-                st.feedback("thumbs", key=f"fb_{idx}")
+                with action_cols[2]:
+                    st.feedback("thumbs", key=f"fb_{idx}")
+            else:
+                with action_cols[1]:
+                    st.feedback("thumbs", key=f"fb_{idx}")
         if message.get("timestamp"):
             st.caption(relative_time(message["timestamp"]))
         if message["role"] == "assistant" and message.get("tutor_log"):
             with st.expander("Tutor reasoning", icon="🧠"):
+                _log_labels = {
+                    "node": "Topic", "step": "Step", "topic": "Subject",
+                    "student_status": "Student Status", "misconception": "Misconception",
+                    "hint_level": "Hint Level", "node_verdict": "Verdict",
+                    "dependency_suspect": "Gap Identified", "problem_type": "Problem Type",
+                }
                 for k, v in message["tutor_log"].items():
-                    st.markdown(f"**{k}:** {v}")
+                    label = _log_labels.get(k, k.replace("_", " ").title())
+                    st.markdown(f"**{label}:** {v}")
         if message["role"] == "assistant" and tts_enabled and message.get("content"):
+            is_recent_assistant = bool(assistant_indices) and idx in assistant_indices[-2:]
             cache_key = f"tts_cache_{idx}"
             # Auto-generate TTS for pending message after rerun
             if "_tts_pending_idx" in st.session_state and st.session_state._tts_pending_idx == idx:
@@ -792,13 +818,15 @@ for idx, message in enumerate(st.session_state.messages):
                 if cache_key not in st.session_state:
                     with st.spinner("Generating speech..."):
                         st.session_state[cache_key] = generate_tts(message["content"])
+                        st.session_state.tts_cache_keys.add(cache_key)
                 audio_bytes = st.session_state.get(cache_key)
                 if audio_bytes:
                     st.audio(audio_bytes, format="audio/wav", autoplay=True)
-            elif st.button("🔊 Read aloud", key=f"tts_btn_{idx}"):
+            elif is_recent_assistant and st.button("🔊 Read aloud", key=f"tts_btn_{idx}"):
                 if cache_key not in st.session_state:
                     with st.spinner("Generating speech..."):
                         st.session_state[cache_key] = generate_tts(message["content"])
+                        st.session_state.tts_cache_keys.add(cache_key)
                 audio_bytes = st.session_state.get(cache_key)
                 if audio_bytes:
                     st.audio(audio_bytes, format="audio/wav", autoplay=True)
@@ -818,7 +846,7 @@ canvas_result = None
 tldraw_result = None
 ketcher_smiles = None
 
-with st.expander("🛠️ Tools", expanded=False):
+with st.expander("🛠️ Drawing Tools", expanded=False):
     toggle_cols = st.columns(3)
     with toggle_cols[0]:
         show_canvas = st.toggle("✏️ Draw", key="show_canvas")
@@ -948,7 +976,7 @@ if result or regen:
         with st.chat_message("user"):
             for f in file_attachments:
                 if f["type"] == "image":
-                    st.image(f["data"], width=200)
+                    st.image(f["data"], width=400)
                 else:
                     st.info(f"📄 PDF: {f['name']}")
             if audio_data:
@@ -994,8 +1022,14 @@ if result or regen:
         if first_chunk is not None:
             full_response = first_chunk
             container.markdown(process_for_display(full_response))
+            chars_since_render = 0
             for chunk in stream_iter:
                 full_response += chunk
+                chars_since_render += len(chunk)
+                if '\n' in chunk or chars_since_render >= 150:
+                    container.markdown(process_for_display(full_response))
+                    chars_since_render = 0
+            if chars_since_render > 0:
                 container.markdown(process_for_display(full_response))
 
         if not full_response:

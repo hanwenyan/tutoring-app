@@ -84,6 +84,7 @@ _GREEK_LATEX = {
     r"\Sigma": "sigma", r"\Phi": "phi", r"\Psi": "psi",
     r"\Omega": "omega",
 }
+_SORTED_GREEK_LATEX = sorted(_GREEK_LATEX, key=len, reverse=True)
 
 
 def _superscript_to_text(content: str) -> str:
@@ -111,7 +112,7 @@ def _superscript_to_text_simple(char: str) -> str:
 def latex_to_speakable(text: str) -> str:
     """Convert LaTeX content (without $ delimiters) to spoken English."""
     # Phase 1: Greek letters (longest-first to avoid partial matches)
-    for cmd in sorted(_GREEK_LATEX, key=len, reverse=True):
+    for cmd in _SORTED_GREEK_LATEX:
         text = text.replace(cmd, f" {_GREEK_LATEX[cmd]} ")
 
     # Phase 2: Structural commands (iterate for nested constructs)
@@ -401,9 +402,17 @@ def ensure_dollar_parity(text: str) -> str:
         i += 1
 
     if len(positions) % 2 == 1:
-        # Odd count — truncate at the last (unpaired) $
+        # Odd count — truncate at paragraph/line boundary before the unpaired $
         last_unpaired = positions[-1]
-        work = work[:last_unpaired]
+        para_break = work.rfind('\n\n', 0, last_unpaired)
+        if para_break > 0:
+            work = work[:para_break]
+        else:
+            line_break = work.rfind('\n', 0, last_unpaired)
+            if line_break > 0:
+                work = work[:line_break]
+            else:
+                work = work[:last_unpaired]
 
     for i, block in enumerate(blocks):
         work = work.replace(f'\x00PAR{i}\x00', block)
