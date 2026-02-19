@@ -39,6 +39,22 @@ def load_graph(path: Path) -> dict | None:
         return None
 
 
+def get_graph_topology(graph: dict) -> list[str]:
+    """Get or compute topological sort order of graph nodes. Cached in graph dict."""
+    if "_topo_order" in graph:
+        return graph["_topo_order"]
+
+    nodes = graph.get("nodes", {})
+    ts = graphlib.TopologicalSorter()
+    for node_id, node_data in nodes.items():
+        deps = node_data.get("deps", [])
+        ts.add(node_id, *deps)
+
+    topo_order = list(ts.static_order())
+    graph["_topo_order"] = topo_order
+    return topo_order
+
+
 def validate_dag(nodes: dict) -> bool:
     """Validate that the knowledge graph is a DAG using topological sort. Returns True if valid."""
     try:
@@ -79,13 +95,7 @@ def get_next_node(graph: dict) -> str | None:
     """Return the first unmastered node with satisfied dependencies, in topological order."""
     nodes = graph.get("nodes", {})
 
-    # Build topological order
-    ts = graphlib.TopologicalSorter()
-    for node_id, node_data in nodes.items():
-        deps = node_data.get("deps", [])
-        ts.add(node_id, *deps)
-
-    topo_order = list(ts.static_order())
+    topo_order = get_graph_topology(graph)
 
     # Find first unmastered node with all deps mastered
     for node_id in topo_order:
@@ -311,11 +321,7 @@ def render_sidebar(provider_key: str, model_name: str, api_key: str, base_url: s
         st.caption(f"**{graph.get('subject', 'Knowledge Graph')}**")
 
         # Build topological order
-        ts = graphlib.TopologicalSorter()
-        for node_id, node_data in nodes.items():
-            deps = node_data.get("deps", [])
-            ts.add(node_id, *deps)
-        topo_order = list(ts.static_order())
+        topo_order = get_graph_topology(graph)
 
         # Display nodes
         for node_id in topo_order:
