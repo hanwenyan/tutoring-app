@@ -717,29 +717,18 @@ with st.sidebar:
 
     # Fill NEW CHAT
     with newchat_container:
-        if not st.session_state.get("_confirm_new_chat"):
-            if st.button("New Chat", use_container_width=True):
-                st.session_state._confirm_new_chat = True
+        with st.popover("New Chat", use_container_width=True):
+            st.markdown("Clear all chat history?")
+            if st.button("Yes, clear", type="primary", use_container_width=True):
+                has_graph = st.session_state.knowledge_graph is not None
+                st.session_state.messages = [get_default_greeting(has_graph)]
+                chat_file = get_chat_file_path()
+                if chat_file.exists():
+                    chat_file.unlink()
+                for k in st.session_state.tts_cache_keys:
+                    st.session_state.pop(k, None)
+                st.session_state.tts_cache_keys = set()
                 st.rerun()
-        else:
-            st.warning("Clear all chat history?")
-            _nc1, _nc2 = st.columns(2)
-            with _nc1:
-                if st.button("Yes, clear", type="primary", use_container_width=True):
-                    del st.session_state._confirm_new_chat
-                    has_graph = st.session_state.knowledge_graph is not None
-                    st.session_state.messages = [get_default_greeting(has_graph)]
-                    chat_file = get_chat_file_path()
-                    if chat_file.exists():
-                        chat_file.unlink()
-                    for k in st.session_state.tts_cache_keys:
-                        st.session_state.pop(k, None)
-                    st.session_state.tts_cache_keys = set()
-                    st.rerun()
-            with _nc2:
-                if st.button("Cancel", use_container_width=True):
-                    del st.session_state._confirm_new_chat
-                    st.rerun()
 
 if "messages" not in st.session_state:
     saved = load_chat()
@@ -780,11 +769,11 @@ for idx, message in enumerate(st.session_state.messages):
             else:
                 action_cols = st.columns([2, 3, 11], gap="small")
             with action_cols[0]:
-                with st.popover("", icon=":material/content_copy:"):
+                with st.popover("", icon=":material/content_copy:", help="Copy message"):
                     st.code(message["content"], language=None)
             if is_last_assistant:
                 with action_cols[1]:
-                    if st.button("", icon=":material/refresh:", key=f"regen_{idx}"):
+                    if st.button("", icon=":material/refresh:", key=f"regen_{idx}", help="Regenerate response"):
                         st.session_state.messages.pop()
                         cache_key = f"tts_cache_{idx}"
                         if cache_key in st.session_state:
