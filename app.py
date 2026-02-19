@@ -46,11 +46,11 @@ def get_session_id() -> str:
     sid = params.get("s")
 
     # 1. Valid ?s= in URL — use it
-    if sid and re.match(r'^[0-9a-f]{8}$', sid):
+    if sid and re.match(r'^[0-9a-f]{8,32}$', sid):
         return sid
 
     # 2. New visitor — generate fresh ID
-    sid = secrets.token_hex(4)
+    sid = secrets.token_hex(16)
     st.query_params["s"] = sid
     return sid
 
