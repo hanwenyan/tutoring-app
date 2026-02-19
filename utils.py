@@ -85,6 +85,7 @@ _GREEK_LATEX = {
     r"\Omega": "omega",
 }
 _SORTED_GREEK_LATEX = sorted(_GREEK_LATEX, key=len, reverse=True)
+_GREEK_RE = re.compile("|".join(re.escape(k) for k in _SORTED_GREEK_LATEX))
 
 
 def _superscript_to_text(content: str) -> str:
@@ -109,75 +110,86 @@ def _superscript_to_text_simple(char: str) -> str:
     return f"to the {char}"
 
 
+_STRUCTURAL_RES = [
+    (re.compile(r"\\frac\{([^{}]*)\}\{([^{}]*)\}"), r" \1 over \2 "),
+    (re.compile(r"\\sqrt\[([^\]]+)\]\{([^{}]*)\}"), r" the \1th root of \2 "),
+    (re.compile(r"\\sqrt\{([^{}]*)\}"), r" square root of \1 "),
+    (re.compile(r"\^\{([^{}]*)\}"), lambda m: f" {_superscript_to_text(m.group(1))} "),
+    (re.compile(r"\^([A-Za-z0-9])"), lambda m: f" {_superscript_to_text_simple(m.group(1))} "),
+    (re.compile(r"_\{([^{}]*)\}"), r" \1 "),
+    (re.compile(r"_([A-Za-z0-9])"), r" \1 "),
+    (re.compile(r"\\(?:text|mathrm|textbf|textit|mathbf|mathit|operatorname)\{([^{}]*)\}"), r" \1 "),
+]
+
+_OPERATORS_LIST = [
+    (r"\times", "times"), (r"\cdot", "times"), (r"\div", "divided by"),
+    (r"\pm", "plus or minus"), (r"\mp", "minus or plus"),
+    (r"\leq", "less than or equal to"), (r"\geq", "greater than or equal to"),
+    (r"\neq", "not equal to"), (r"\approx", "approximately equal to"),
+    (r"\lt", "less than"), (r"\gt", "greater than"),
+    (r"\rightarrow", "yields"), (r"\to", "yields"),
+    (r"\leftarrow", "yields"),
+    (r"\rightleftharpoons", "is in equilibrium with"),
+    (r"\leftrightarrow", "is in equilibrium with"),
+    (r"\infty", "infinity"), (r"\partial", "partial"),
+    (r"\nabla", "del"),
+    (r"\int", "integral of"), (r"\sum", "sum of"),
+    (r"\prod", "product of"), (r"\lim", "limit of"),
+    (r"\log", "log"), (r"\ln", "natural log of"),
+    (r"\sin", "sine"), (r"\cos", "cosine"), (r"\tan", "tangent"),
+    (r"\sec", "secant"), (r"\csc", "cosecant"), (r"\cot", "cotangent"),
+    (r"\arcsin", "arc sine"), (r"\arccos", "arc cosine"), (r"\arctan", "arc tangent"),
+    (r"\overline", "bar"), (r"\vec", "vector"), (r"\hat", "hat"),
+    (r"\dot", "dot"), (r"\ddot", "double dot"),
+    (r"\left", ""), (r"\right", ""),
+    (r"\big", ""), (r"\Big", ""), (r"\bigg", ""), (r"\Bigg", ""),
+]
+_OPERATORS_LIST.sort(key=lambda x: len(x[0]), reverse=True)
+_OPERATORS_RE = re.compile("|".join(re.escape(x[0]) for x in _OPERATORS_LIST))
+_OPERATORS_MAP = dict(_OPERATORS_LIST)
+
+_SPACING_CMDS = [r"\,", r"\;", r"\:", r"\!", r"\quad", r"\qquad", r"\ "]
+_SPACING_RE = re.compile("|".join(re.escape(x) for x in _SPACING_CMDS))
+
+_UNICODE_MATH_LIST = sorted(UNICODE_MATH_MAP.items(), key=lambda x: len(x[0]), reverse=True)
+_UNICODE_MATH_RE = re.compile("|".join(re.escape(x[0]) for x in _UNICODE_MATH_LIST))
+
+_CLEANUP_RE1 = re.compile(r"\\[a-zA-Z]+")
+_CLEANUP_RE2 = re.compile(r"[{}$&\\]")
+_CLEANUP_RE3 = re.compile(r"\s+")
+
+
 def latex_to_speakable(text: str) -> str:
     """Convert LaTeX content (without $ delimiters) to spoken English."""
-    # Phase 1: Greek letters (longest-first to avoid partial matches)
-    for cmd in _SORTED_GREEK_LATEX:
-        text = text.replace(cmd, f" {_GREEK_LATEX[cmd]} ")
+    # Phase 1: Greek letters
+    text = _GREEK_RE.sub(lambda m: f" {_GREEK_LATEX[m.group(0)]} ", text)
 
-    # Phase 2: Structural commands (iterate for nested constructs)
-    for _ in range(10):
-        prev = text
-        # \frac{a}{b} → "a over b"
-        text = re.sub(r"\\frac\{([^{}]*)\}\{([^{}]*)\}", r" \1 over \2 ", text)
-        # \sqrt[n]{x} → "the nth root of x"
-        text = re.sub(r"\\sqrt\[([^\]]+)\]\{([^{}]*)\}", r" the \1th root of \2 ", text)
-        # \sqrt{x} → "square root of x"
-        text = re.sub(r"\\sqrt\{([^{}]*)\}", r" square root of \1 ", text)
-        # x^{content} → via helper
-        text = re.sub(r"\^\{([^{}]*)\}", lambda m: f" {_superscript_to_text(m.group(1))} ", text)
-        # x^N (single char) → via helper
-        text = re.sub(r"\^([A-Za-z0-9])", lambda m: f" {_superscript_to_text_simple(m.group(1))} ", text)
-        # x_{content} → subscript as space-separated
-        text = re.sub(r"_\{([^{}]*)\}", r" \1 ", text)
-        # x_N (single char) → space
-        text = re.sub(r"_([A-Za-z0-9])", r" \1 ", text)
-        # \text{...}, \mathrm{...}, \textbf{...}, \textit{...} → unwrap
-        text = re.sub(r"\\(?:text|mathrm|textbf|textit|mathbf|mathit|operatorname)\{([^{}]*)\}", r" \1 ", text)
-        if text == prev:
-            break
+    # Optimization: Only enter Phase 2 if needed
+    if any(c in text for c in ("\\", "^", "_")):
+        # Phase 2: Structural commands (iterate for nested constructs)
+        for _ in range(10):
+            changed = False
+            for regex, replacement in _STRUCTURAL_RES:
+                text, count = regex.subn(replacement, text)
+                if count > 0:
+                    changed = True
+            if not changed:
+                break
 
-    # Operators
-    for cmd, spoken in [
-        (r"\times", "times"), (r"\cdot", "times"), (r"\div", "divided by"),
-        (r"\pm", "plus or minus"), (r"\mp", "minus or plus"),
-        (r"\leq", "less than or equal to"), (r"\geq", "greater than or equal to"),
-        (r"\neq", "not equal to"), (r"\approx", "approximately equal to"),
-        (r"\lt", "less than"), (r"\gt", "greater than"),
-        (r"\rightarrow", "yields"), (r"\to", "yields"),
-        (r"\leftarrow", "yields"),
-        (r"\rightleftharpoons", "is in equilibrium with"),
-        (r"\leftrightarrow", "is in equilibrium with"),
-        (r"\infty", "infinity"), (r"\partial", "partial"),
-        (r"\nabla", "del"),
-        (r"\int", "integral of"), (r"\sum", "sum of"),
-        (r"\prod", "product of"), (r"\lim", "limit of"),
-        (r"\log", "log"), (r"\ln", "natural log of"),
-        (r"\sin", "sine"), (r"\cos", "cosine"), (r"\tan", "tangent"),
-        (r"\sec", "secant"), (r"\csc", "cosecant"), (r"\cot", "cotangent"),
-        (r"\arcsin", "arc sine"), (r"\arccos", "arc cosine"), (r"\arctan", "arc tangent"),
-        (r"\overline", "bar"), (r"\vec", "vector"), (r"\hat", "hat"),
-        (r"\dot", "dot"), (r"\ddot", "double dot"),
-        (r"\left", ""), (r"\right", ""),
-        (r"\big", ""), (r"\Big", ""), (r"\bigg", ""), (r"\Bigg", ""),
-    ]:
-        text = text.replace(cmd, f" {spoken} ")
+    # Phase 3: Operators & Spacing
+    text = _OPERATORS_RE.sub(lambda m: f" {_OPERATORS_MAP[m.group(0)]} ", text)
+    text = _SPACING_RE.sub(" ", text)
 
-    # Spacing commands → space
-    for cmd in [r"\,", r"\;", r"\:", r"\!", r"\quad", r"\qquad", r"\ "]:
-        text = text.replace(cmd, " ")
+    # Phase 4: Unicode symbols
+    text = _UNICODE_MATH_RE.sub(lambda m: f" {UNICODE_MATH_MAP[m.group(0)]} ", text)
 
-    # Phase 3: Unicode symbols
-    for sym, spoken in UNICODE_MATH_MAP.items():
-        text = text.replace(sym, f" {spoken} ")
-
-    # Phase 4: Emoji stripping
+    # Phase 5: Emoji stripping
     text = _EMOJI_RE.sub(" ", text)
 
-    # Phase 5: Cleanup
-    text = re.sub(r"\\[a-zA-Z]+", " ", text)  # remaining \commands
-    text = re.sub(r"[{}$&\\]", " ", text)       # stray braces, $, &, backslash
-    text = re.sub(r"\s+", " ", text)            # collapse whitespace
+    # Phase 6: Cleanup
+    text = _CLEANUP_RE1.sub(" ", text)   # remaining \commands
+    text = _CLEANUP_RE2.sub(" ", text)   # stray braces, $, &, backslash
+    text = _CLEANUP_RE3.sub(" ", text)   # collapse whitespace
     return text.strip()
 
 
@@ -440,7 +452,7 @@ def process_for_display(text: str, final: bool = False) -> str:
 
 
 def convert_latex_delimiters(text: str) -> str:
-    """Convert LaTeX delimiters \(...\) → $...$ and \[...\] → $$...$$.
+    r"""Convert LaTeX delimiters \(...\) → $...$ and \[...\] → $$...$$.
 
     Protects code fences and inline code from modification.
     Streamlit's KaTeX only recognizes $ delimiters, not \( \) \[ \].
